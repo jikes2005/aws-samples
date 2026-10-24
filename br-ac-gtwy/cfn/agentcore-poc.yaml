@@ -416,12 +416,15 @@ Resources:
               pid = event.get("PhysicalResourceId", "")
 
               if rtype == "Delete":
+                  # Best effort: never block a stack delete. The client is a child of the user
+                  # pool, so deleting the pool (which follows) removes it anyway.
                   if CLIENT_ID_RE.match(pid):
                       try:
                           idp.delete_user_pool_client(UserPoolId=p["UserPoolId"], ClientId=pid)
-                      except ClientError as e:
-                          if e.response["Error"]["Code"] != "ResourceNotFoundException":
-                              raise
+                          print(f"Deleted app client {pid}")
+                      except Exception as e:
+                          print(f"WARNING: could not delete app client {pid} ({type(e).__name__}: {e}); "
+                                "it is removed with the user pool")
                   return pid, {}
 
               replace = rtype == "Create" or any(old.get(k) != p.get(k) for k in ("UserPoolId", "ClientName"))
