@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 
@@ -17,6 +18,7 @@ except ImportError:  # older Strands (mcp 1.x only)
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("customer_agent")
+MAX_LOG_CHARS = 2000  # truncate long tool results in the log
 
 # Settings come from the runtime's environment variables (set by the CloudFormation stack)
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
@@ -57,6 +59,27 @@ SYSTEM_PROMPT = (
 log.info("Agent configured: model=%s region=%s gateway=%s", MODEL_ID, REGION, GATEWAY_URL)
 
 
+def log_tool_calls(messages):
+    """Log each MCP tool call the agent made and the result the gateway returned."""
+    for message in messages:
+        for block in message.get("content", []):
+            if "toolUse" in block:
+                call = block["toolUse"]
+                log.info("MCP call: %s input=%s", call["name"], call.get("input"))
+            elif "toolResult" in block:
+                res = block["toolResult"]
+                text = " ".join(one_line(c.get("text", c.get("json", ""))) for c in res.get("content", []))
+                log.info("MCP result (%s): %s", res.get("status"), text[:MAX_LOG_CHARS])
+
+
+def one_line(value):
+    """Compact a tool result onto one line (CloudWatch logs each line as a separate event)."""
+    try:
+        return json.dumps(json.loads(value) if isinstance(value, str) else value, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value).replace("\n", " ")
+
+
 @app.entrypoint
 def invoke(payload):
     log.info("Received payload: %s", payload)
@@ -74,6 +97,8 @@ def invoke(payload):
 
         agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, tools=tools, callback_handler=None)
         result = agent(prompt)
+
+    log_tool_calls(agent.messages)
 
     tools_used = {name: m.call_count for name, m in result.metrics.tool_metrics.items()}
     log.info("Tools used: %s", tools_used)

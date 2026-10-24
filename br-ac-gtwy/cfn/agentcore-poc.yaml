@@ -713,8 +713,12 @@ Resources:
           from decimal import Decimal
           import boto3
           from boto3.dynamodb.conditions import Attr, Key
+          from botocore.config import Config
 
-          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+          # Short timeouts: a blocked DynamoDB path returns a logged 500 quickly instead of
+          # hanging until API Gateway's 29 s integration timeout.
+          table = boto3.resource("dynamodb", config=Config(connect_timeout=3, read_timeout=5,
+                                 retries={"max_attempts": 2})).Table(os.environ["TABLE_NAME"])
           REQUIRED = ("firstName", "lastName", "email")
           SEGMENTS = {"RETAIL", "SMALL_BUSINESS", "WEALTH"}
           EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -797,7 +801,9 @@ Resources:
                   return _resp(405, {"message": f"{method} {resource} not supported"})
               except Exception as e:
                   print(f"ERROR {type(e).__name__}: {e}")
-                  return _resp(500, {"message": "Internal error"})
+                  hint = " - check the DynamoDB gateway endpoint on the Lambda subnets' route tables" \
+                      if "timeout" in str(e).lower() or "connect" in str(e).lower() else ""
+                  return _resp(500, {"message": f"Internal error ({type(e).__name__}){hint}"})
 
   # =====================================================================
   # API Gateway (private REST + Cognito authorizer)
@@ -1100,7 +1106,7 @@ Resources:
       Runtime: python3.12
       Architectures: [arm64]
       Handler: index.handler
-      Timeout: 15
+      Timeout: 30
       MemorySize: 256
       Role: !GetAtt ToolFnRole.Arn
       KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
@@ -1115,8 +1121,12 @@ Resources:
           TOKEN_SCOPES: customer-api/customers.read customer-api/customers.write
       Code:
         ZipFile: |
-          import json, os, time, urllib.request, urllib.error, urllib.parse
+          import json, logging, os, socket, time, urllib.request, urllib.error, urllib.parse
           import boto3
+          from botocore.config import Config
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
 
           BASE = os.environ["API_BASE_URL"].rstrip("/")
           REGION = os.environ["AWS_REGION"]
@@ -1126,32 +1136,63 @@ Resources:
           IDP_URL = f"https://cognito-idp.{REGION}.amazonaws.com/"
           DELIM = "___"  # Gateway sends "<targetName>___<toolName>"
 
+          # Short timeouts so a blocked network path fails fast with a clear message
+          # instead of hanging until the Lambda times out.
+          idp = boto3.client("cognito-idp", config=Config(connect_timeout=3, read_timeout=5,
+                                                          retries={"max_attempts": 2}))
           _secret = None
           _token = {"value": None, "exp": 0}
+
+
+          class Blocked(Exception):
+              """A network call from the VPC timed out or failed to connect."""
+
+
+          def _ms(t):
+              return int((time.time() - t) * 1000)
+
 
           def _client_secret():
               global _secret
               if _secret is None:
-                  idp = boto3.client("cognito-idp")
-                  _secret = idp.describe_user_pool_client(
-                      UserPoolId=POOL_ID, ClientId=CLIENT_ID)["UserPoolClient"]["ClientSecret"]
+                  t = time.time()
+                  try:
+                      _secret = idp.describe_user_pool_client(
+                          UserPoolId=POOL_ID, ClientId=CLIENT_ID)["UserPoolClient"]["ClientSecret"]
+                  except Exception as e:
+                      if "timeout" in str(e).lower() or "connect" in str(e).lower():
+                          raise Blocked(f"Cognito DescribeUserPoolClient ({IDP_URL}): {e}. "
+                                        "Check the cognito-idp VPC endpoint (private DNS, SG 443 from the VPC range)")
+                      raise
+                  log.info("cognito: client secret loaded in %d ms", _ms(t))
               return _secret
+
 
           def _access_token():
               # Cognito GetClientToken: M2M token without a user pool domain (works over
-              # PrivateLink, unlike /oauth2/token). Raw JSON call so it doesn't depend on
+              # PrivateLink, unlike /oauth2/token). Raw JSON call so it does not depend on
               # the Lambda runtime's bundled boto3 version. Not SigV4 - auth is id+secret.
               if _token["value"] and time.time() < _token["exp"] - 60:
                   return _token["value"]
+              secret = _client_secret()
+              t = time.time()
               req = urllib.request.Request(
                   IDP_URL, method="POST",
-                  data=json.dumps({"ClientId": CLIENT_ID, "Secret": _client_secret(), "Scopes": SCOPES}).encode(),
+                  data=json.dumps({"ClientId": CLIENT_ID, "Secret": secret, "Scopes": SCOPES}).encode(),
                   headers={"Content-Type": "application/x-amz-json-1.1",
                            "X-Amz-Target": "AWSCognitoIdentityProviderService.GetClientToken"})
-              with urllib.request.urlopen(req, timeout=5) as r:
-                  res = json.loads(r.read())["ClientAuthenticationResult"]
+              try:
+                  with urllib.request.urlopen(req, timeout=5) as r:
+                      res = json.loads(r.read())["ClientAuthenticationResult"]
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError(f"Cognito GetClientToken HTTP {e.code}: {e.read()[:300]!r}")
+              except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+                  raise Blocked(f"Cognito GetClientToken ({IDP_URL}): {e}. "
+                                "Check the cognito-idp VPC endpoint (private DNS, SG 443 from the VPC range)")
               _token.update(value=res["AccessToken"], exp=time.time() + int(res["ExpiresIn"]))
+              log.info("cognito: access token issued in %d ms", _ms(t))
               return _token["value"]
+
 
           def _call(method, path, body=None, query=None):
               url = BASE + path
@@ -1163,10 +1204,13 @@ Resources:
               req = urllib.request.Request(url, data=data, method=method, headers={
                   "Content-Type": "application/json",
                   "Authorization": f"Bearer {_access_token()}"})
+              t = time.time()
               try:
-                  with urllib.request.urlopen(req, timeout=10) as r:
+                  with urllib.request.urlopen(req, timeout=12) as r:
+                      log.info("api: %s %s -> %d in %d ms", method, path, r.status, _ms(t))
                       return {"status": r.status, "data": json.loads(r.read() or b"{}")}
               except urllib.error.HTTPError as e:
+                  log.warning("api: %s %s -> %d in %d ms", method, path, e.code, _ms(t))
                   if e.code == 401:
                       _token["value"] = None  # force refresh next call
                   try:
@@ -1174,22 +1218,37 @@ Resources:
                   except ValueError:
                       err = {"message": e.reason}
                   return {"status": e.code, "error": err}
+              except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+                  raise Blocked(f"Customer API {method} {url}: {e}. Check the execute-api VPC endpoint "
+                                "(private DNS, SG 443 from the VPC range) and that it is the endpoint the API is "
+                                "pinned to (ExecuteApiVpceId). A 504 or slow response points at the API Lambda / DynamoDB")
+
 
           def handler(event, context):
               cc = getattr(context, "client_context", None)
               full = (cc.custom or {}).get("bedrockAgentCoreToolName", "") if cc else ""
               tool = full.split(DELIM, 1)[-1]
-              print(json.dumps({"tool": tool, "args": event}))
-
-              if tool == "list_customers":
-                  return _call("GET", "/customers", query={k: event.get(k) for k in ("status", "segment", "province")})
-              if tool == "get_customer":
-                  cid = urllib.parse.quote(str(event.get("customerId", "")), safe="")
-                  return _call("GET", f"/customers/{cid}")
-              if tool == "create_customer":
-                  allowed = ("firstName", "lastName", "email", "segment", "city", "province")
-                  return _call("POST", "/customers", body={k: event[k] for k in allowed if k in event})
-              return {"status": 400, "error": {"message": f"Unknown tool '{tool}'"}}
+              log.info("tool=%s args=%s", tool, json.dumps(event)[:500])
+              t = time.time()
+              try:
+                  if tool == "list_customers":
+                      out = _call("GET", "/customers", query={k: event.get(k) for k in ("status", "segment", "province")})
+                  elif tool == "get_customer":
+                      cid = urllib.parse.quote(str(event.get("customerId", "")), safe="")
+                      out = _call("GET", f"/customers/{cid}")
+                  elif tool == "create_customer":
+                      allowed = ("firstName", "lastName", "email", "segment", "city", "province")
+                      out = _call("POST", "/customers", body={k: event[k] for k in allowed if k in event})
+                  else:
+                      out = {"status": 400, "error": {"message": f"Unknown tool '{tool}'"}}
+              except Blocked as e:
+                  log.error("BLOCKED after %d ms: %s", _ms(t), e)
+                  out = {"status": 504, "error": {"message": f"Network path blocked: {e}"}}
+              except Exception as e:
+                  log.exception("tool %s failed", tool)
+                  out = {"status": 500, "error": {"message": f"{type(e).__name__}: {e}"}}
+              log.info("tool=%s status=%s in %d ms", tool, out.get("status"), _ms(t))
+              return out
 
   # =====================================================================
   # AgentCore Gateway (MCP)
@@ -1356,6 +1415,10 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
                   # System cross-region profiles (us./global.) may be addressed with or without an account ID
                   - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/*"
+              - Sid: ApplyGuardrail
+                Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
               - Sid: InvokeGateway
                 Effect: Allow
                 Action: bedrock-agentcore:InvokeGateway
