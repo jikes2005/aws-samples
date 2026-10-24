@@ -2,8 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   AgentCore POC (single stack). Uses an EXISTING VPC, subnets and VPC endpoints.
   Strands agent on AgentCore Runtime -> AgentCore Gateway (MCP) -> tool Lambda ->
-  private API Gateway (Cognito M2M authorizer) -> Lambda -> DynamoDB.
-  Custom resources create the Cognito app client (ALLOW_CLIENT_TOKEN_AUTH), seed sample data
+  private API Gateway (IAM auth, SigV4) -> Lambda -> DynamoDB.
+  Custom resources seed sample data
   and take an on-demand DynamoDB backup. A customer managed KMS key encrypts every resource
   that supports one.
 
@@ -215,39 +215,11 @@ Resources:
         KMSMasterKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   # =====================================================================
-  # Cognito (machine-to-machine). No user pool domain on purpose: a domain
-  # blocks user pool requests through the cognito-idp VPC endpoint. Tokens
-  # are issued with the GetClientToken API instead of /oauth2/token.
-  # =====================================================================
-  UserPool:
-    Type: AWS::Cognito::UserPool
-    Properties:
-      UserPoolTags:
-        AppCatID: !Ref AppCatID
-        Description: "Cognito user pool for M2M API auth"
-        ServiceName: !Ref ServiceName
-        Support-Team: !Ref SupportTeam
-        Environment: !Ref Environment
-        Project: !Ref ProjectName
-      UserPoolName: !Sub "${ProjectName}-pool"
-      AdminCreateUserConfig:
-        AllowAdminCreateUserOnly: true
-
-  ResourceServer:
-    Type: AWS::Cognito::UserPoolResourceServer
-    Properties:
-      UserPoolId: !Ref UserPool
-      Identifier: customer-api
-      Name: Customer API
-      Scopes:
-        - { ScopeName: customers.read, ScopeDescription: Read customers }
-        - { ScopeName: customers.write, ScopeDescription: Create customers }
-
-  # =====================================================================
-  # Deploy-time helper Lambda for both custom resources
-  #   Custom::CognitoM2MClient - app client with ALLOW_CLIENT_TOKEN_AUTH, which
-  #       AWS::Cognito::UserPoolClient doesn't accept yet. Ref = client ID.
-  #   Custom::SeedCustomers   - writes sample customers (never overwrites).
+  # Deploy-time helper Lambda for the custom resources
+  #   Custom::SeedCustomers           - writes sample customers (never overwrites)
+  #   Custom::DynamoDbOnDemandBackup  - on-demand backup, deleted with the stack
+  #   Custom::TableDeletionGuard      - lifts table deletion protection on stack delete
+  #   Custom::RuntimeLogCleanup       - deletes the runtime's service-created log group
   # =====================================================================
   DeployHelperRole:
     Type: AWS::IAM::Role
@@ -278,13 +250,6 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: Allow
-                Action:
-                  - cognito-idp:CreateUserPoolClient
-                  - cognito-idp:UpdateUserPoolClient
-                  - cognito-idp:DeleteUserPoolClient
-                  - cognito-idp:DescribeUserPoolClient
-                Resource: !GetAtt UserPool.Arn
               - Effect: Allow
                 Action: [dynamodb:PutItem, dynamodb:CreateBackup, dynamodb:UpdateTable, dynamodb:DescribeTable]
                 Resource: !GetAtt CustomersTable.Arn
@@ -349,7 +314,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
       FunctionName: !Sub "${ProjectName}-deploy-helper"
-      Description: CloudFormation custom resources (Cognito client, seed, backup, delete-time cleanup)
+      Description: CloudFormation custom resources (seed, backup, delete-time cleanup)
       Runtime: python3.12
       Architectures: [arm64]
       Handler: index.handler
@@ -358,17 +323,15 @@ Resources:
       Role: !GetAtt DeployHelperRole.Arn
       KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
       # Deliberately NOT in the VPC (same pattern as the RAG POC's schema-init Lambda).
-      # It only runs at deploy time, calls Cognito and DynamoDB control-plane APIs, and must
+      # It only runs at deploy time, calls DynamoDB and CloudWatch Logs APIs, and must
       # PUT its result to CloudFormation's pre-signed S3 URL, which these private subnets
       # can't resolve. The org hook reports this as a warning (Lam.23), not an error.
       Code:
         ZipFile: |
-          import json, re, time, threading, urllib.request
+          import json, time, threading, urllib.request
           from decimal import Decimal
           import boto3
           from botocore.exceptions import ClientError
-
-          CLIENT_ID_RE = re.compile(r"^[a-z0-9]{20,128}$")
 
           def send(event, context, status, physical_id, data=None, reason=None):
               body = json.dumps({
@@ -390,43 +353,6 @@ Resources:
                       print(f"Failed to send CloudFormation response (attempt {attempt + 1}/5): {e}")
                       time.sleep(2)
               print("Gave up sending the CloudFormation response; the stack will wait for ServiceTimeout")
-
-          # ---------- Custom::CognitoM2MClient ----------
-          def _client_cfg(p):
-              return dict(
-                  UserPoolId=p["UserPoolId"], ClientName=p["ClientName"],
-                  ExplicitAuthFlows=["ALLOW_CLIENT_TOKEN_AUTH"],   # must be the only flow
-                  AllowedOAuthFlows=["client_credentials"], AllowedOAuthFlowsUserPoolClient=True,
-                  AllowedOAuthScopes=p["Scopes"],
-                  AccessTokenValidity=int(p.get("AccessTokenValidityMinutes", 60)),
-                  TokenValidityUnits={"AccessToken": "minutes"})
-
-          def cognito_client(event):
-              idp = boto3.client("cognito-idp")
-              p, rtype = event["ResourceProperties"], event["RequestType"]
-              old = event.get("OldResourceProperties", {})
-              pid = event.get("PhysicalResourceId", "")
-
-              if rtype == "Delete":
-                  # Best effort: never block a stack delete. The client is a child of the user
-                  # pool, so deleting the pool (which follows) removes it anyway.
-                  if CLIENT_ID_RE.match(pid):
-                      try:
-                          idp.delete_user_pool_client(UserPoolId=p["UserPoolId"], ClientId=pid)
-                          print(f"Deleted app client {pid}")
-                      except Exception as e:
-                          print(f"WARNING: could not delete app client {pid} ({type(e).__name__}: {e}); "
-                                "it is removed with the user pool")
-                  return pid, {}
-
-              replace = rtype == "Create" or any(old.get(k) != p.get(k) for k in ("UserPoolId", "ClientName"))
-              if replace:
-                  # New physical ID -> CloudFormation deletes the old client after a successful update.
-                  c = idp.create_user_pool_client(GenerateSecret=True, **_client_cfg(p))["UserPoolClient"]
-              else:
-                  c = idp.update_user_pool_client(ClientId=pid, **_client_cfg(p))["UserPoolClient"]
-              # The secret is NOT returned to CloudFormation; consumers read it from Cognito.
-              return c["ClientId"], {"ClientId": c["ClientId"]}
 
           # ---------- Custom::SeedCustomers ----------
           SEED = [
@@ -529,7 +455,7 @@ Resources:
                               raise
               return event.get("PhysicalResourceId", f"log-cleanup-{name}"), {}
 
-          HANDLERS = {"Custom::CognitoM2MClient": cognito_client, "Custom::SeedCustomers": seed,
+          HANDLERS = {"Custom::SeedCustomers": seed,
                       "Custom::DynamoDbOnDemandBackup": on_demand_backup,
                       "Custom::TableDeletionGuard": table_deletion_guard,
                       "Custom::RuntimeLogCleanup": runtime_log_cleanup}
@@ -552,26 +478,22 @@ Resources:
               guard.daemon = True
               guard.start()
               try:
-                  new_pid, data = HANDLERS[event["ResourceType"]](event)
+                  fn = HANDLERS.get(event["ResourceType"])
+                  if fn is None and event["RequestType"] == "Delete":
+                      # A resource type this helper no longer manages (e.g. the retired
+                      # Custom::CognitoM2MClient) - let CloudFormation remove it cleanly.
+                      print(f"Retired resource type {event['ResourceType']}: delete is a no-op")
+                      respond("SUCCESS", pid)
+                      return
+                  if fn is None:
+                      raise ValueError(f"Unknown resource type {event['ResourceType']}")
+                  new_pid, data = fn(event)
                   respond("SUCCESS", new_pid, data)
               except Exception as e:
                   print(f"ERROR {type(e).__name__}: {e}")
                   respond("FAILED", pid, reason=f"{type(e).__name__}: {e}")
               finally:
                   guard.cancel()
-
-  CognitoM2MClient:
-    Type: Custom::CognitoM2MClient
-    DependsOn: ResourceServer          # scopes must exist before the client references them
-    Properties:
-      ServiceToken: !GetAtt DeployHelperFn.Arn
-      ServiceTimeout: 300
-      UserPoolId: !Ref UserPool
-      ClientName: !Sub "${ProjectName}-mcp-tools"
-      Scopes:
-        - customer-api/customers.read
-        - customer-api/customers.write
-      AccessTokenValidityMinutes: "60"
 
   SeedCustomers:
     Type: Custom::SeedCustomers
@@ -787,9 +709,9 @@ Resources:
               return _resp(201, item)
 
           def handler(event, context):
-              claims = (event.get("requestContext", {}).get("authorizer") or {}).get("claims", {})
+              ident = (event.get("requestContext") or {}).get("identity") or {}
               print(json.dumps({"method": event.get("httpMethod"), "resource": event.get("resource"),
-                                "client_id": claims.get("client_id"), "scope": claims.get("scope")}))
+                                "caller": ident.get("userArn"), "vpce": ident.get("vpceId")}))
               method, resource = event.get("httpMethod"), event.get("resource")
               try:
                   if method == "GET" and resource == "/customers":
@@ -806,7 +728,7 @@ Resources:
                   return _resp(500, {"message": f"Internal error ({type(e).__name__}){hint}"})
 
   # =====================================================================
-  # API Gateway (private REST + Cognito authorizer)
+  # API Gateway (private REST, IAM auth)
   # =====================================================================
   CustomerApi:
     Type: AWS::ApiGateway::RestApi
@@ -825,33 +747,28 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
       Name: !Sub "${ProjectName}-customer-api"
-      Description: Private customer API (Cognito-protected) for the AgentCore POC
+      Description: Private customer API (IAM auth) for the AgentCore POC
       EndpointConfiguration:
         Types: [PRIVATE]
         VpcEndpointIds: [!Ref ExecuteApiVpceId]
       Policy:
         Version: "2012-10-17"
         Statement:
-          - Effect: Allow
-            Principal: "*"
+          # IAM principals in this account whose own IAM policy allows execute-api:Invoke
+          # (the tool Lambda role). With AWS_IAM auth every request must be SigV4-signed.
+          - Sid: AllowIamPrincipalsInThisAccount
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
             Action: execute-api:Invoke
             Resource: execute-api:/*
-          - Effect: Deny
+          - Sid: OnlyThroughTheVpcEndpoint
+            Effect: Deny
             Principal: "*"
             Action: execute-api:Invoke
             Resource: execute-api:/*
             Condition:
               StringNotEquals:
                 aws:SourceVpce: !Ref ExecuteApiVpceId
-
-  CognitoAuthorizer:
-    Type: AWS::ApiGateway::Authorizer
-    Properties:
-      Name: cognito-m2m
-      RestApiId: !Ref CustomerApi
-      Type: COGNITO_USER_POOLS
-      IdentitySource: method.request.header.Authorization
-      ProviderARNs: [!GetAtt UserPool.Arn]
 
   CustomersResource:
     Type: AWS::ApiGateway::Resource
@@ -873,9 +790,7 @@ Resources:
       RestApiId: !Ref CustomerApi
       ResourceId: !Ref CustomersResource
       HttpMethod: GET
-      AuthorizationType: COGNITO_USER_POOLS
-      AuthorizerId: !Ref CognitoAuthorizer
-      AuthorizationScopes: [customer-api/customers.read]
+      AuthorizationType: AWS_IAM
       RequestParameters:
         method.request.querystring.status: false
         method.request.querystring.segment: false
@@ -891,9 +806,7 @@ Resources:
       RestApiId: !Ref CustomerApi
       ResourceId: !Ref CustomersResource
       HttpMethod: POST
-      AuthorizationType: COGNITO_USER_POOLS
-      AuthorizerId: !Ref CognitoAuthorizer
-      AuthorizationScopes: [customer-api/customers.write]
+      AuthorizationType: AWS_IAM
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -905,9 +818,7 @@ Resources:
       RestApiId: !Ref CustomerApi
       ResourceId: !Ref CustomerIdResource
       HttpMethod: GET
-      AuthorizationType: COGNITO_USER_POOLS
-      AuthorizerId: !Ref CognitoAuthorizer
-      AuthorizationScopes: [customer-api/customers.read]
+      AuthorizationType: AWS_IAM
       RequestParameters:
         method.request.path.customerId: true
       Integration:
@@ -1014,9 +925,9 @@ Resources:
           "protocol":"$context.protocol","responseLength":"$context.responseLength",
           "responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency",
           "sourceIp":"$context.identity.sourceIp","vpceId":"$context.identity.vpceId",
-          "clientId":"$context.authorizer.claims.client_id","scope":"$context.authorizer.claims.scope",
+          "caller":"$context.identity.userArn","callerAccount":"$context.identity.accountId",
           "xrayTraceId":"$context.xrayTraceId","errorMessage":"$context.error.message",
-          "authorizerError":"$context.authorizer.error"}
+          "authError":"$context.error.responseType"}
       MethodSettings:
         - ResourcePath: "/*"
           HttpMethod: "*"
@@ -1024,7 +935,7 @@ Resources:
           DataTraceEnabled: false
 
   # =====================================================================
-  # MCP tool Lambda (Gateway target) - Cognito M2M token -> private API
+  # MCP tool Lambda (Gateway target) - SigV4-signed calls to the private API
   # =====================================================================
   ToolFnRole:
     Type: AWS::IAM::Role
@@ -1051,15 +962,14 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
       Policies:
-        - PolicyName: read-app-client-secret
+        - PolicyName: invoke-customer-api
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Secret is read from Cognito at cold start - never stored in env vars,
-              # templates, stack outputs or Secrets Manager.
-              - Effect: Allow
-                Action: cognito-idp:DescribeUserPoolClient
-                Resource: !GetAtt UserPool.Arn
+              - Sid: InvokeCustomerApi
+                Effect: Allow
+                Action: execute-api:Invoke
+                Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomerApi}/*/*/*"
               - Sid: DecryptEnvVars
                 Effect: Allow
                 Action: kms:Decrypt
@@ -1116,15 +1026,13 @@ Resources:
       Environment:
         Variables:
           API_BASE_URL: !Sub "https://${CustomerApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
-          USER_POOL_ID: !Ref UserPool
-          CLIENT_ID: !Ref CognitoM2MClient
-          TOKEN_SCOPES: customer-api/customers.read customer-api/customers.write
           LOG_LEVEL: INFO              # DEBUG adds botocore wire-level logs
       Code:
         ZipFile: |
           import ipaddress, json, logging, os, socket, threading, time, urllib.request, urllib.error, urllib.parse
           import boto3
-          from botocore.config import Config
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
 
           log = logging.getLogger()
           log.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -1133,21 +1041,12 @@ Resources:
 
           BASE = os.environ["API_BASE_URL"].rstrip("/")
           REGION = os.environ["AWS_REGION"]
-          POOL_ID, CLIENT_ID = os.environ["USER_POOL_ID"], os.environ["CLIENT_ID"]
-          SCOPES = os.environ["TOKEN_SCOPES"].split()
-          IDP_HOST = f"cognito-idp.{REGION}.amazonaws.com"
-          IDP_URL = f"https://{IDP_HOST}/"
           API_HOST = urllib.parse.urlparse(BASE).hostname
           DELIM = "___"  # Gateway sends "<targetName>___<toolName>"
-
-          log.info("config: api=%s pool=%s client=%s region=%s", BASE, POOL_ID, CLIENT_ID, REGION)
-
-          # Short timeouts so a blocked path fails fast instead of hanging until the Lambda times out.
-          idp = boto3.client("cognito-idp", config=Config(connect_timeout=3, read_timeout=5,
-                                                          retries={"max_attempts": 1}))
-          _secret = None
-          _token = {"value": None, "exp": 0}
+          session = boto3.Session()
           _probes = {}
+
+          log.info("config: api=%s region=%s auth=IAM (SigV4 with this function's role)", BASE, REGION)
 
 
           class Blocked(Exception):
@@ -1203,50 +1102,11 @@ Resources:
               return problem
 
 
-          def _client_secret():
-              global _secret
-              if _secret is None:
-                  if (p := probe(IDP_HOST, "cognito-idp")):
-                      raise Blocked(p)
-                  log.info("cognito: DescribeUserPoolClient ...")
-                  t = time.time()
-                  try:
-                      _secret = idp.describe_user_pool_client(
-                          UserPoolId=POOL_ID, ClientId=CLIENT_ID)["UserPoolClient"]["ClientSecret"]
-                  except Exception as e:
-                      log.error("cognito: DescribeUserPoolClient failed after %d ms: %s: %s", _ms(t), type(e).__name__, e)
-                      raise
-                  log.info("cognito: client secret loaded in %d ms", _ms(t))
-              return _secret
-
-
-          def _access_token():
-              # Cognito GetClientToken: M2M token without a user pool domain (works over
-              # PrivateLink, unlike /oauth2/token). Raw JSON call so it does not depend on
-              # the Lambda runtime's bundled boto3 version. Not SigV4 - auth is id+secret.
-              if _token["value"] and time.time() < _token["exp"] - 60:
-                  log.info("cognito: reusing cached access token")
-                  return _token["value"]
-              secret = _client_secret()
-              log.info("cognito: GetClientToken scopes=%s ...", SCOPES)
-              t = time.time()
-              req = urllib.request.Request(
-                  IDP_URL, method="POST",
-                  data=json.dumps({"ClientId": CLIENT_ID, "Secret": secret, "Scopes": SCOPES}).encode(),
-                  headers={"Content-Type": "application/x-amz-json-1.1",
-                           "X-Amz-Target": "AWSCognitoIdentityProviderService.GetClientToken"})
-              try:
-                  with urllib.request.urlopen(req, timeout=5) as r:
-                      res = json.loads(r.read())["ClientAuthenticationResult"]
-              except urllib.error.HTTPError as e:
-                  body = e.read()[:300]
-                  log.error("cognito: GetClientToken HTTP %d after %d ms: %r", e.code, _ms(t), body)
-                  raise RuntimeError(f"Cognito GetClientToken HTTP {e.code}: {body!r}")
-              except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
-                  raise Blocked(f"Cognito GetClientToken ({IDP_URL}) failed after {_ms(t)} ms: {e}")
-              _token.update(value=res["AccessToken"], exp=time.time() + int(res["ExpiresIn"]))
-              log.info("cognito: access token issued in %d ms (expires in %ss)", _ms(t), res["ExpiresIn"])
-              return _token["value"]
+          def _signed(method, url, data):
+              """Build a urllib request SigV4-signed for execute-api with the Lambda role's credentials."""
+              aws_req = AWSRequest(method=method, url=url, data=data, headers={"Content-Type": "application/json"})
+              SigV4Auth(session.get_credentials().get_frozen_credentials(), "execute-api", REGION).add_auth(aws_req)
+              return urllib.request.Request(url, data=data, method=method, headers=dict(aws_req.headers))
 
 
           def _call(method, path, body=None, query=None):
@@ -1255,12 +1115,10 @@ Resources:
                   q = {k: v for k, v in query.items() if v}
                   if q:
                       url += "?" + urllib.parse.urlencode(q)
-              token = _access_token()
               if (p := probe(API_HOST, "execute-api")):
                   raise Blocked(p)
               data = json.dumps(body).encode() if body is not None else None
-              req = urllib.request.Request(url, data=data, method=method, headers={
-                  "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+              req = _signed(method, url, data)
               log.info("api: %s %s body=%s ...", method, url, (data or b"")[:300].decode())
               t = time.time()
               try:
@@ -1270,13 +1128,15 @@ Resources:
                       return {"status": r.status, "data": json.loads(raw or b"{}")}
               except urllib.error.HTTPError as e:
                   raw = e.read() or b"{}"
+                  etype = e.headers.get("x-amzn-errortype", "")
                   log.warning("api: %s %s -> %d in %d ms: %s (x-amzn-errortype=%s, apigw request id=%s)", method, path,
-                              e.code, _ms(t), raw[:300], e.headers.get("x-amzn-errortype"), e.headers.get("x-amzn-requestid"))
-                  if e.code == 401:
-                      _token["value"] = None  # force refresh next call
+                              e.code, _ms(t), raw[:300], etype, e.headers.get("x-amzn-requestid"))
                   if e.code == 403:
-                      log.warning("api: 403 usually means the request didn't arrive through the execute-api endpoint the "
-                                  "API is pinned to (ExecuteApiVpceId), or the token lacks the method's scope")
+                      if "Signature" in etype or "Signature" in raw.decode(errors="replace"):
+                          log.warning("api: signature rejected - check the request is signed for execute-api in %s", REGION)
+                      else:
+                          log.warning("api: 403 means this role lacks execute-api:Invoke on the API, or the request "
+                                      "didn't arrive through the execute-api endpoint the API is pinned to (ExecuteApiVpceId)")
                   try:
                       err = json.loads(raw)
                   except ValueError:
@@ -1549,10 +1409,6 @@ Outputs:
     Value: !Sub "https://${CustomerApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
   CustomersTableName:
     Value: !Ref CustomersTable
-  UserPoolId:
-    Value: !Ref UserPool
-  ToolsAppClientId:
-    Value: !Ref CognitoM2MClient
   ToolFunctionName:
     Value: !Ref ToolFn
   KmsKeyArn:

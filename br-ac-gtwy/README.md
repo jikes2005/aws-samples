@@ -1,6 +1,6 @@
 # AgentCore POC
 
-Strands agent on **Bedrock AgentCore Runtime** → **AgentCore Gateway** (MCP) → **Lambda** tool → **private API Gateway** (Cognito-protected) → Lambda → **DynamoDB**.
+Strands agent on **Bedrock AgentCore Runtime** → **AgentCore Gateway** (MCP) → **Lambda** tool → **private API Gateway** (IAM auth) → Lambda → **DynamoDB**.
 
 Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and runs in an existing VPC using existing subnets and VPC endpoints. Nothing is internet-facing.
 
@@ -12,20 +12,20 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and 
 │   Strands agent ──SigV4 MCP──► AgentCore Gateway (MCP, AWS_IAM inbound auth)        │
 │        │                              │ GATEWAY_IAM_ROLE                            │
 │        └──► Bedrock (model)           ▼                                             │
-│                       Lambda: customer-tools ──GetClientToken──► Cognito user pool  │
-│                              │  Bearer <access token>            (M2M, no domain)   │
+│                       Lambda: customer-tools                                        │
+│                              │  SigV4-signed with its role (execute-api:Invoke)     │
 │                              ▼                                                      │
-│              Private REST API + Cognito authorizer (scopes)                         │
-│                GET  /customers               customer-api/customers.read            │
-│                GET  /customers/{customerId}  customer-api/customers.read            │
-│                POST /customers               customer-api/customers.write           │
+│              Private REST API, AWS_IAM authorization                                │
+│                GET  /customers                                                      │
+│                GET  /customers/{customerId}                                         │
+│                POST /customers                                                      │
 │                              │ AWS_PROXY                                            │
 │                              ▼                                                      │
 │              Lambda: customer-api ──► DynamoDB  <project>-customers                 │
 │                                                                                     │
 │  (Deploy time only, OUTSIDE the VPC: Lambda deploy-helper - custom resources)      │
-│     Custom::CognitoM2MClient → creates the M2M app client                           │
 │     Custom::SeedCustomers    → loads 4 sample customers                             │
+│     + on-demand backup and delete-time cleanup                                      │
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -33,13 +33,13 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and 
 
 | Path | What it is |
 |---|---|
-| `cfn/agentcore-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB (PITR + on-demand backup), Cognito (pool, resource server, custom-resource app client), seed custom resource, private REST API + Cognito authorizer, API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
+| `cfn/agentcore-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB (PITR + on-demand backup), seed custom resource, private REST API (IAM auth), API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
 | `agent/customer_agent.py` | Strands agent; loads tools from the gateway over MCP with SigV4 auth |
 | `agent/requirements.txt` | Agent dependencies. The agent works with `mcp` 1.x and 2.x |
 | `agent/build_agent.ipynb` | Builds the arm64 agent zip in SageMaker AI, uploads it to S3, optionally updates the stack and tests the agent |
 | `scripts/deploy.sh` | Packages the agent for linux/arm64, uploads it to S3, deploys the stack, redeploys the API stage |
 | `scripts/invoke.py` | Calls the runtime with a prompt from your laptop |
-| `scripts/test-api.sh` | Gets a Cognito token and curls the API (run from inside the VPC) |
+| `scripts/test-api.sh` | Curls the API with SigV4-signed requests (run from inside the VPC) |
 
 ## Prerequisites — what must already exist
 
@@ -50,7 +50,6 @@ Don't allow 443 from the stack's workload security group instead. That rule woul
 | Endpoint | Used by |
 |---|---|
 | `com.amazonaws.<region>.execute-api` | Tool Lambda → private API (its ID is a stack parameter) |
-| `com.amazonaws.<region>.cognito-idp` | Tool Lambda (token), deploy helper (app client) |
 | `com.amazonaws.<region>.dynamodb` (gateway endpoint on the subnets' route tables) | API Lambda, deploy helper (seed) |
 | `com.amazonaws.<region>.bedrock-runtime` | Agent → model |
 | `com.amazonaws.<region>.bedrock-agentcore.gateway` | Agent → MCP gateway |
@@ -127,32 +126,29 @@ aws lambda invoke --function-name agentcore-poc-customer-tools \
   --payload file://events/tool-get-customer.json out.json && cat out.json
 ```
 
-**API directly** (from an instance in the VPC): `./scripts/test-api.sh` checks that a request without a token gets 401, then runs the GETs and a POST.
+**API directly** (from an instance in the VPC): `./scripts/test-api.sh` checks that an unsigned request gets 403, then runs signed GETs and a POST. Your credentials need `execute-api:Invoke` on the API.
 
 ## Why the deploy helper runs outside the VPC
 
 Every Lambda that serves traffic (API backend, MCP tool) runs in the VPC. The one exception is `deploy-helper`, which only runs while CloudFormation creates, updates or deletes the stack. This is the same pattern as the RAG POC's schema-init Lambda.
 
 - **Why it can't run in the VPC:** after each custom-resource action it must `PUT` its result to a pre-signed URL in an AWS-owned S3 bucket (`cloudformation-custom-resource-response-<region>`). The private subnets can't resolve that hostname. In the VPC this failed with `URLError: [Errno 16] Device or resource busy`, Lambda's form of a DNS failure. CloudFormation then waited and rolled back.
-- **What it calls:** only AWS APIs (Cognito app-client management, DynamoDB `PutItem` and `CreateBackup`) and the response URL. Nothing in the VPC.
+- **What it calls:** only AWS APIs (DynamoDB and CloudWatch Logs) and the response URL. Nothing in the VPC.
 - **How it answers CloudFormation:** it retries the response up to 5 times. A timer also sends `FAILED` 20 seconds before the Lambda times out, so a hung call can't leave the stack waiting.
 - **Effect on the org hook:** it flags this as a **warning** (Lam.23), not an error, so it doesn't block the deploy. Checkov reports the same as CKV_AWS_117.
 
 To move it into the VPC later, the subnets need DNS resolution and a route to `*.s3.<region>.amazonaws.com`, and an S3 endpoint policy that allows `s3:PutObject` on the response bucket. Then add `VpcConfig` back to `DeployHelperFn` and `AWSLambdaVPCAccessExecutionRole` to its role.
 
-## Cognito custom resource
+## Custom resources
 
-`AWS::Cognito::UserPoolClient` doesn't accept the `ALLOW_CLIENT_TOKEN_AUTH` flow yet, and Cognito won't add that flow to an existing client. So the app client is a `Custom::CognitoM2MClient` backed by the `deploy-helper` Lambda.
+The `deploy-helper` Lambda backs four custom resources:
 
-- **Create:** creates the client with a secret, `ALLOW_CLIENT_TOKEN_AUTH` as the only flow, `client_credentials`, the two scopes, and a 60-minute token. `Ref` returns the client ID.
-- **Update:** changing the scopes or token validity updates the client in place. Changing `UserPoolId` or `ClientName` creates a new client, and CloudFormation then deletes the old one.
-- **Delete:** deletes the client. It ignores a client that is already gone.
-- **The client secret never leaves Cognito.** It isn't returned to CloudFormation, so it's not in stack events or outputs. The tool Lambda reads it with `DescribeUserPoolClient` at cold start (IAM-scoped to this pool).
-- The resource `DependsOn` the resource server, so the scopes exist before the client references them.
+- **`Custom::SeedCustomers`:** loads 4 sample customers on create. It uses conditional puts, so it never overwrites records. Bump `SeedVersion` to re-run it. Nothing happens on delete, because the table goes with the stack.
+- **`Custom::DynamoDbOnDemandBackup`:** takes a native on-demand backup, and deletes it with the stack.
+- **`Custom::TableDeletionGuard`:** lifts the table's deletion protection right before stack delete.
+- **`Custom::RuntimeLogCleanup`:** deletes the runtime's service-created log group after the runtime is gone.
 
-`Custom::SeedCustomers` loads 4 sample customers on create. It uses conditional puts, so it never overwrites records. Bump `SeedVersion` to re-run it. Nothing happens on delete, because the table goes with the stack.
-
-When CloudFormation adds the flow, replace the custom resource with a native `AWS::Cognito::UserPoolClient`.
+A `Delete` for a resource type the helper no longer manages, such as the removed `Custom::CognitoM2MClient`, succeeds as a no-op. So a stack deployed with the earlier Cognito version updates cleanly.
 
 **If a custom resource can't reach CloudFormation**, the helper logs each failed send. If all 5 fail, the stack waits up to `ServiceTimeout` (5 minutes) and then fails.
 
@@ -165,7 +161,7 @@ The account runs a CloudFormation hook that scans **the template itself**, befor
 | API.31 – stage tagged `ApplyCommonWaf` | Literal `"true"` tag on `ApiStage` |
 | DDB.14 – deletion protection | `DeletionProtectionEnabled: true` on the table. `TableDeletionGuard` lifts it only when the stack is deleted |
 | Lam.23 – Lambda in a VPC (warning) | The API and tool Lambdas run in the VPC. `deploy-helper` intentionally doesn't (see *Why the deploy helper runs outside the VPC*), so this stays a non-blocking warning for that one function |
-| Required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (24). `Description` is per resource. The others come from parameters |
+| Required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (20). `Description` is per resource. The others come from parameters |
 | DDB.11 – on-demand backup | Literal tag `dynamodbbackup: "True"` on the table. The hook checks the tag, which enrols the table in the organisation's backup policy (confirm with your platform team) |
 
 Resources that can't take tags are skipped: custom resources, API methods and resources, the authorizer, deployment, Lambda permission, KMS alias and gateway target.
@@ -201,7 +197,6 @@ Checkov 3.x result for the template: **81 passed, 8 failed**. None of the failur
 | AgentCore Gateway | CMK |
 | AgentCore Runtime (serverless) | AWS-owned key. No CMK option for the serverless compute type |
 | AgentCore Runtime log group | Created by the service at first run, so it has the default encryption. Add a CMK afterwards with `aws logs associate-kms-key` if needed |
-| Cognito user pool | AWS-owned key. Cognito has no CMK option for user pool data |
 | API Gateway | No data at rest (no cache configured) |
 | Agent zip in S3 | Your existing bucket's encryption settings |
 
@@ -266,11 +261,13 @@ If it still times out, look at the first lines of the runtime log:
 
 ## Design notes
 
-- **Cognito without a domain.** A user pool with a domain can't be reached through the cognito-idp VPC endpoint, and `/oauth2/token` isn't available over PrivateLink. So the pool has no domain, and the tool Lambda uses Cognito's `GetClientToken` API (client-credentials M2M), which goes through the cognito-idp endpoint.
-  - It's called as a raw JSON request, so it doesn't depend on the boto3 version bundled in the Lambda runtime.
-  - Tokens are cached until a minute before expiry; a 401 forces a refresh.
-- **Scopes per method.** GET requires `customer-api/customers.read`, POST requires `customer-api/customers.write`. The API Lambda logs the caller's `client_id`.
-- **Private API** keeps the resource policy that denies anything not arriving through your execute-api endpoint, so a request needs both the right network path and a valid token.
+- **IAM auth on the API (no Cognito).** All three methods use `AWS_IAM` authorization. The tool Lambda SigV4-signs each request for `execute-api` with its own role's credentials.
+  - Its role is allowed `execute-api:Invoke` on this API only.
+  - The API's resource policy allows IAM principals in this account. A caller also needs `execute-api:Invoke` in its own IAM policy.
+  - The API Lambda logs the caller's role ARN and VPC endpoint ID, and the access log records `caller` and `callerAccount`.
+  - The only network dependency is the `execute-api` VPC endpoint.
+  - Earlier versions used a Cognito M2M token, which needed a `cognito-idp` VPC endpoint the VPC didn't have.
+- **Private API** keeps the resource policy that denies anything not arriving through your execute-api endpoint, so a request needs both the right network path and a valid signature.
 - **Gateway auth:** inbound `AWS_IAM` (only the runtime role can invoke it; the agent SigV4-signs MCP calls), outbound `GATEWAY_IAM_ROLE` (the gateway role can invoke only the tool Lambda).
 - **DynamoDB:** on-demand, PITR and encryption on.
   - `list_customers` uses a Scan with filters, which is fine at POC size. Add GSIs for real access patterns.
@@ -293,7 +290,6 @@ Deleting the stack removes everything it created. No resources have `DeletionPol
 | DynamoDB table (deletion protection on) | `TableDeletionGuard` is deleted first. It turns deletion protection off and waits for the table to be `ACTIVE`, then CloudFormation deletes the table |
 | On-demand backup | `OnDemandBackup` deletes its backup |
 | AgentCore Runtime log group (`/aws/bedrock-agentcore/runtimes/<name>-*`, created by the service) | `RuntimeLogCleanup` deletes it after the runtime is gone. The runtime takes its name from this resource, so CloudFormation deletes the runtime first |
-| Cognito app client | `CognitoM2MClient` deletes it before the user pool goes |
 | Lambda, API access and helper log groups | Owned by the stack, deleted normally |
 | KMS key and alias | Deleted with the stack. KMS doesn't delete keys immediately: the key enters **Pending deletion for 7 days** (the minimum) and is then destroyed. To recover it in that window, run `aws kms cancel-key-deletion` |
 
