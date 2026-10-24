@@ -14,9 +14,12 @@ EXECUTE_API_VPCE="${EXECUTE_API_VPCE:?set EXECUTE_API_VPCE (existing execute-api
 ARTIFACT_BUCKET="${ARTIFACT_BUCKET:?set ARTIFACT_BUCKET (existing S3 bucket)}"
 MODEL_ID="${MODEL_ID:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
 STAGE="${STAGE:-dev}"
-HELPER_IN_VPC="${HELPER_IN_VPC:-true}"   # false if the VPC has no S3 gateway endpoint
+# Required organisation tags
+APP_CAT_ID="${APP_CAT_ID:?set APP_CAT_ID (AppCatID tag)}"
+SUPPORT_TEAM="${SUPPORT_TEAM:?set SUPPORT_TEAM (Support-Team tag)}"
+SERVICE_NAME="${SERVICE_NAME:-AgentCore MCP POC}"
+ENVIRONMENT="${ENVIRONMENT:-dev}"
 KMS_KEY_ARN="${KMS_KEY_ARN:-}"           # blank = stack creates its own CMK
-APPLY_COMMON_WAF="${APPLY_COMMON_WAF:-true}"
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-35}"
 CREATE_APIGW_ACCOUNT_ROLE="${CREATE_APIGW_ACCOUNT_ROLE:-false}"  # true only if the account has no API GW CloudWatch role
 
@@ -47,8 +50,8 @@ aws cloudformation deploy --region "$REGION" \
   --stack-name "$STACK" --template-file "$ROOT/cfn/agentcore-mcp-poc.yaml" \
   --parameter-overrides ProjectName="$PROJECT" StageName="$STAGE" \
     VpcId="$VPC_ID" PrivateSubnetIds="$SUBNET_IDS" ExecuteApiVpceId="$EXECUTE_API_VPCE" \
-    HelperFunctionsInVpc="$HELPER_IN_VPC" \
-    ExistingKmsKeyArn="$KMS_KEY_ARN" ApplyCommonWaf="$APPLY_COMMON_WAF" \
+    AppCatID="$APP_CAT_ID" SupportTeam="$SUPPORT_TEAM" ServiceName="$SERVICE_NAME" Environment="$ENVIRONMENT" \
+    ExistingKmsKeyArn="$KMS_KEY_ARN" \
     BackupRetentionDays="$BACKUP_RETENTION_DAYS" CreateApiGatewayAccountRole="$CREATE_APIGW_ACCOUNT_ROLE" \
     ArtifactBucket="$ARTIFACT_BUCKET" AgentCodeKey="$CODE_KEY" ModelId="$MODEL_ID" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset

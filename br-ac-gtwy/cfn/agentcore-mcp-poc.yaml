@@ -11,11 +11,13 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: Existing network }
-        Parameters: [VpcId, PrivateSubnetIds, ExecuteApiVpceId, HelperFunctionsInVpc]
+        Parameters: [VpcId, PrivateSubnetIds, ExecuteApiVpceId]
       - Label: { default: Agent }
         Parameters: [ArtifactBucket, AgentCodeKey, ModelId]
       - Label: { default: "Encryption, backup and API controls" }
-        Parameters: [ExistingKmsKeyArn, BackupRetentionDays, ApplyCommonWaf, CreateApiGatewayAccountRole]
+        Parameters: [ExistingKmsKeyArn, BackupRetentionDays, CreateApiGatewayAccountRole]
+      - Label: { default: Required tags }
+        Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
       - Label: { default: General }
         Parameters: [ProjectName, StageName]
 
@@ -36,14 +38,6 @@ Parameters:
     Type: String
     AllowedPattern: "^vpce-[0-9a-f]+$"
     Description: Existing execute-api interface endpoint ID (private API is pinned to it)
-  HelperFunctionsInVpc:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "true"
-    Description: >
-      Run the deploy-time custom-resource Lambda in the VPC. Needs an S3 gateway endpoint
-      so it can send its result to CloudFormation's pre-signed S3 URL. Set false if the VPC
-      has no S3 route (the helper then uses public AWS endpoints).
   ArtifactBucket:
     Type: String
     Description: Existing S3 bucket holding the agent code zip
@@ -67,11 +61,6 @@ Parameters:
     MinValue: 1
     MaxValue: 3650
     Description: Retention for the daily AWS Backup recovery points
-  ApplyCommonWaf:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "true"
-    Description: Value of the ApplyCommonWaf tag on the API stage
   CreateApiGatewayAccountRole:
     Type: String
     AllowedValues: ["true", "false"]
@@ -81,8 +70,27 @@ Parameters:
       settings (one per account and region). Set true ONLY if the account has none - this
       overwrites the existing account setting.
 
+  # ---- Required organisation tags (BMO.01) ----
+  AppCatID:
+    Type: String
+    MinLength: 1
+    Description: Application catalogue ID (AppCatID tag)
+  ServiceName:
+    Type: String
+    Default: AgentCore MCP POC
+    MinLength: 1
+    Description: ServiceName tag
+  SupportTeam:
+    Type: String
+    MinLength: 1
+    Description: Support-Team tag
+  Environment:
+    Type: String
+    Default: dev
+    MinLength: 1
+    Description: Environment tag
+
 Conditions:
-  HelperInVpc: !Equals [!Ref HelperFunctionsInVpc, "true"]
   CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
   CreateApiGwAccount: !Equals [!Ref CreateApiGatewayAccountRole, "true"]
 
@@ -98,6 +106,19 @@ Resources:
     DeletionPolicy: Retain             # keep the key so retained backups stay readable
     UpdateReplacePolicy: Retain
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "CMK for data at rest"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       Description: !Sub "${ProjectName} - CMK for data at rest"
       EnableKeyRotation: true
       PendingWindowInDays: 30
@@ -158,9 +179,6 @@ Resources:
                 kms:ViaService:
                   - !Sub "backup.${AWS::Region}.amazonaws.com"
                   - !Sub "dynamodb.${AWS::Region}.amazonaws.com"
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
 
   KmsKeyAlias:
     Type: AWS::KMS::Alias
@@ -175,6 +193,21 @@ Resources:
   WorkloadSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Workload SG for Lambdas and AgentCore Runtime"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: !Sub "${ProjectName}-workload-sg"
       GroupDescription: !Sub "${ProjectName} workloads (Lambda, AgentCore Runtime)"
       VpcId: !Ref VpcId
       SecurityGroupEgress:
@@ -183,9 +216,6 @@ Resources:
           ToPort: 443
           CidrIp: 0.0.0.0/0
           Description: HTTPS to VPC endpoints
-      Tags:
-        - Key: Name
-          Value: !Sub "${ProjectName}-workload-sg"
 
   # =====================================================================
   # DynamoDB
@@ -195,8 +225,22 @@ Resources:
     DeletionPolicy: Delete          # POC - use Retain for real data
     UpdateReplacePolicy: Delete
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Customer records for the sample API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       TableName: !Sub "${ProjectName}-customers"
       BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true   # disable before deleting the stack (see README)
       AttributeDefinitions:
         - { AttributeName: customerId, AttributeType: S }
         - { AttributeName: email, AttributeType: S }
@@ -214,9 +258,6 @@ Resources:
         SSEEnabled: true
         SSEType: KMS
         KMSMasterKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
 
   # ---------------- AWS Backup (scheduled backups, CMK-encrypted vault) ----------------
   BackupVault:
@@ -224,12 +265,26 @@ Resources:
     DeletionPolicy: Retain             # recovery points outlive the stack
     UpdateReplacePolicy: Retain
     Properties:
+      BackupVaultTags:
+        AppCatID: !Ref AppCatID
+        Description: "Backup vault for the customers table"
+        ServiceName: !Ref ServiceName
+        Support-Team: !Ref SupportTeam
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
       BackupVaultName: !Sub "${ProjectName}-vault"
       EncryptionKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   BackupPlan:
     Type: AWS::Backup::BackupPlan
     Properties:
+      BackupPlanTags:
+        AppCatID: !Ref AppCatID
+        Description: "Daily backup plan for the customers table"
+        ServiceName: !Ref ServiceName
+        Support-Team: !Ref SupportTeam
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
       BackupPlan:
         BackupPlanName: !Sub "${ProjectName}-daily"
         BackupPlanRule:
@@ -244,6 +299,19 @@ Resources:
   BackupRole:
     Type: AWS::IAM::Role
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AWS Backup service role"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -271,6 +339,13 @@ Resources:
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
+      UserPoolTags:
+        AppCatID: !Ref AppCatID
+        Description: "Cognito user pool for M2M API auth"
+        ServiceName: !Ref ServiceName
+        Support-Team: !Ref SupportTeam
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
       UserPoolName: !Sub "${ProjectName}-pool"
       AdminCreateUserConfig:
         AllowAdminCreateUserOnly: true
@@ -294,6 +369,19 @@ Resources:
   DeployHelperRole:
     Type: AWS::IAM::Role
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Role for deploy-time custom resources"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -332,6 +420,19 @@ Resources:
   DeployHelperLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the deploy helper Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-deploy-helper"
       RetentionInDays: 14
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
@@ -340,6 +441,19 @@ Resources:
     Type: AWS::Lambda::Function
     DependsOn: DeployHelperLogGroup
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Deploy-time custom resources"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       FunctionName: !Sub "${ProjectName}-deploy-helper"
       Description: CloudFormation custom resources (Cognito M2M client, data seed)
       Runtime: python3.12
@@ -349,11 +463,11 @@ Resources:
       MemorySize: 256
       Role: !GetAtt DeployHelperRole.Arn
       KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-      VpcConfig: !If
-        - HelperInVpc
-        - SubnetIds: !Ref PrivateSubnetIds
-          SecurityGroupIds: [!Ref WorkloadSecurityGroup]
-        - !Ref AWS::NoValue
+      # Always in the VPC (org policy). Needs the S3 gateway endpoint to send its
+      # result to CloudFormation's pre-signed S3 URL.
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [!Ref WorkloadSecurityGroup]
       Code:
         ZipFile: |
           import json, re, urllib.request
@@ -512,6 +626,19 @@ Resources:
   CustomerApiFnRole:
     Type: AWS::IAM::Role
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Role for the customer API Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -545,6 +672,19 @@ Resources:
   CustomerApiFnLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the customer API Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-api"
       RetentionInDays: 14
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
@@ -553,6 +693,19 @@ Resources:
     Type: AWS::Lambda::Function
     DependsOn: CustomerApiFnLogGroup
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Customer API backend - DynamoDB CRUD"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       FunctionName: !Sub "${ProjectName}-customer-api"
       Runtime: python3.12
       Architectures: [arm64]
@@ -665,6 +818,19 @@ Resources:
   CustomerApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Private customer REST API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       Name: !Sub "${ProjectName}-customer-api"
       Description: Private customer API (Cognito-protected) for the AgentCore MCP POC
       EndpointConfiguration:
@@ -773,6 +939,19 @@ Resources:
   ApiAccessLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Access logs for the customer API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       LogGroupName: !Sub "/aws/apigateway/${ProjectName}-customer-api/access"
       RetentionInDays: 90
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
@@ -783,6 +962,19 @@ Resources:
     Type: AWS::IAM::Role
     Condition: CreateApiGwAccount
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "API Gateway account logging role"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -803,6 +995,21 @@ Resources:
   ApiStage:
     Type: AWS::ApiGateway::Stage
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Customer API stage"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ApplyCommonWaf
+          Value: "true"   # literal on purpose: set "true" or "false"
       RestApiId: !Ref CustomerApi
       DeploymentId: !Ref ApiDeployment
       StageName: !Ref StageName
@@ -824,11 +1031,6 @@ Resources:
           HttpMethod: "*"
           MetricsEnabled: true
           DataTraceEnabled: false
-      Tags:
-        - Key: ApplyCommonWaf
-          Value: !Ref ApplyCommonWaf
-        - Key: Project
-          Value: !Ref ProjectName
 
   # =====================================================================
   # MCP tool Lambda (Gateway target) - Cognito M2M token -> private API
@@ -836,6 +1038,19 @@ Resources:
   ToolFnRole:
     Type: AWS::IAM::Role
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Role for the MCP tool Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -862,6 +1077,19 @@ Resources:
   ToolFnLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the MCP tool Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-tools"
       RetentionInDays: 14
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
@@ -870,6 +1098,19 @@ Resources:
     Type: AWS::Lambda::Function
     DependsOn: ToolFnLogGroup
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "MCP tool - calls the customer API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       FunctionName: !Sub "${ProjectName}-customer-tools"
       Runtime: python3.12
       Architectures: [arm64]
@@ -971,6 +1212,19 @@ Resources:
   GatewayRole:
     Type: AWS::IAM::Role
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Gateway service role"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -993,6 +1247,13 @@ Resources:
   McpGateway:
     Type: AWS::BedrockAgentCore::Gateway
     Properties:
+      Tags:
+        AppCatID: !Ref AppCatID
+        Description: "AgentCore MCP gateway for customer tools"
+        ServiceName: !Ref ServiceName
+        Support-Team: !Ref SupportTeam
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
       Name: !Sub "${ProjectName}-gw"
       Description: MCP gateway exposing customer API tools
       ProtocolType: MCP
@@ -1059,6 +1320,19 @@ Resources:
   RuntimeRole:
     Type: AWS::IAM::Role
     Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Runtime execution role"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -1102,6 +1376,13 @@ Resources:
   AgentRuntime:
     Type: AWS::BedrockAgentCore::Runtime
     Properties:
+      Tags:
+        AppCatID: !Ref AppCatID
+        Description: "Strands customer agent"
+        ServiceName: !Ref ServiceName
+        Support-Team: !Ref SupportTeam
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
       AgentRuntimeName: !Join ["_", !Split ["-", !Sub "${ProjectName}_agent"]]
       Description: Strands agent calling customer API tools through AgentCore Gateway (MCP)
       RoleArn: !GetAtt RuntimeRole.Arn

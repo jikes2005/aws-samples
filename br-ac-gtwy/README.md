@@ -50,7 +50,7 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-mcp-poc.yaml`) 
 | `com.amazonaws.<region>.execute-api` | Tool Lambda → private API (its ID is a stack parameter) |
 | `com.amazonaws.<region>.cognito-idp` | Tool Lambda (token), deploy helper (app client) |
 | `com.amazonaws.<region>.dynamodb` (gateway endpoint on the subnets' route tables) | API Lambda, deploy helper (seed) |
-| `com.amazonaws.<region>.s3` (gateway endpoint on the subnets' route tables) | Deploy helper → sends its result to CloudFormation's pre-signed S3 URL. Not needed if `HelperFunctionsInVpc=false` |
+| `com.amazonaws.<region>.s3` (gateway endpoint on the subnets' route tables) | Deploy helper → sends its result to CloudFormation's pre-signed S3 URL. **Required** (the helper always runs in the VPC) |
 | `com.amazonaws.<region>.bedrock-runtime` | Agent → model |
 | `com.amazonaws.<region>.bedrock-agentcore.gateway` | Agent → MCP gateway |
 | `com.amazonaws.<region>.logs` | Agent runtime logging |
@@ -70,9 +70,11 @@ export VPC_ID=vpc-xxxxxxxx
 export SUBNET_IDS=subnet-aaaa,subnet-bbbb
 export EXECUTE_API_VPCE=vpce-xxxxxxxx
 export ARTIFACT_BUCKET=my-artifacts-bucket
-# export HELPER_IN_VPC=false   # only if the VPC has no S3 gateway endpoint
+export APP_CAT_ID=APP12345         # required tag AppCatID
+export SUPPORT_TEAM=my-team        # required tag Support-Team
+# export SERVICE_NAME="AgentCore MCP POC"      # tag ServiceName (default shown)
+# export ENVIRONMENT=dev                       # tag Environment (default dev)
 # export KMS_KEY_ARN=arn:aws:kms:...:key/...   # use an existing CMK (blank = stack creates one)
-# export APPLY_COMMON_WAF=false                # ApplyCommonWaf stage tag (default true)
 # export BACKUP_RETENTION_DAYS=35
 # export CREATE_APIGW_ACCOUNT_ROLE=true        # only if the account has no API Gateway CloudWatch role
 ./scripts/deploy.sh
@@ -135,16 +137,29 @@ aws lambda invoke --function-name agentcore-mcp-poc-customer-tools \
 
 When CloudFormation adds the flow, replace the custom resource with a native `AWS::Cognito::UserPoolClient`.
 
-**If a custom resource can't reach CloudFormation** (no S3 route from the subnets), the stack waits up to `ServiceTimeout` (5 minutes) and then fails. Fix the S3 gateway endpoint, or set `HelperFunctionsInVpc=false`.
+**If a custom resource can't reach CloudFormation** (no S3 route from the subnets), the stack waits up to `ServiceTimeout` (5 minutes) and then fails. Fix the S3 gateway endpoint (route on the private subnets' route tables, and an endpoint policy that allows the CloudFormation response bucket).
 
-## Security controls
+## Organisation policy hook (CCF::PAC::LambdaHook)
+
+The account runs a CloudFormation hook that scans **the template itself**, before parameters are resolved. Write any value the hook checks as a literal, never as `!Ref` or `!If`.
+
+| Hook finding | Fix in the template |
+|---|---|
+| API.31 – stage tagged `ApplyCommonWaf` | Literal `"true"` tag on `ApiStage` |
+| DDB.14 – deletion protection | `DeletionProtectionEnabled: true` on the table |
+| Lam.23 – Lambda in a VPC | The deploy helper always runs in the VPC (the earlier opt-out was removed) |
+| BMO.01 – required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (24). `Description` is per resource. The others come from parameters |
+| DDB.11 – on-demand backup | AWS Backup plan + native on-demand backup are in place. The hook's exact expectation is still being confirmed |
+
+Resources that can't take tags are skipped: custom resources, API methods and resources, the authorizer, deployment, Lambda permission, KMS alias, backup selection and gateway target.
+
 
 | Requirement | How it's met | Scanner check (Checkov) |
 |---|---|---|
 | Customer managed KMS key everywhere it's supported | One CMK (rotation on), or bring your own via `ExistingKmsKeyArn`. See coverage below | CKV_AWS_119, 158, 166, 173, 7 |
 | DynamoDB encrypted with the CMK | `SSEType: KMS` + `KMSMasterKeyId` | CKV_AWS_119 |
 | On-demand backup configured | AWS Backup daily plan into a CMK-encrypted vault (`BackupRetentionDays`, default 35), **plus** a native DynamoDB on-demand backup taken at deploy (`Custom::DynamoDbOnDemandBackup`). PITR stays on | CKV_AWS_166, CKV_AWS_28 |
-| API stage tagged `ApplyCommonWaf` | Stage tag from the `ApplyCommonWaf` parameter (`true`/`false`, default `true`) | — |
+| API stage tagged `ApplyCommonWaf` | Literal `"true"` on the stage's tags. It's not a parameter, because the org hook scans the template and can't resolve `!Ref`. Edit the value to `"false"` if needed | API.31 |
 | X-Ray tracing on the API stage | `TracingEnabled: true` | CKV_AWS_73 |
 | API Gateway access logging | JSON access logs to a CMK-encrypted log group, 90-day retention | CKV_AWS_76 |
 
@@ -207,6 +222,8 @@ API Gateway access logging needs a CloudWatch Logs role set at the **account lev
 ## Cleanup
 
 ```bash
+# Deletion protection is on - turn it off first or the delete fails
+aws dynamodb update-table --table-name agentcore-mcp-poc-customers --no-deletion-protection-enabled
 aws cloudformation delete-stack --stack-name agentcore-mcp-poc
 aws cloudformation wait stack-delete-complete --stack-name agentcore-mcp-poc
 ```
