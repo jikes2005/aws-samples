@@ -266,6 +266,10 @@ If it still times out, look at the first lines of the runtime log:
   - The API's resource policy allows IAM principals in this account. A caller also needs `execute-api:Invoke` in its own IAM policy.
   - The API Lambda logs the caller's role ARN and VPC endpoint ID, and the access log records `caller` and `callerAccount`.
   - The only network dependency is the `execute-api` VPC endpoint.
+  - **The tool Lambda calls the API-specific hostname** `{api-id}-{vpce-id}.execute-api.{region}.amazonaws.com`, the `CustomerApiBaseUrl` output.
+    - That name exists because the API is associated with the endpoint (`ExecuteApiVpceId`), and it always routes to this API.
+    - It works even when the `execute-api` endpoint is shared from a networking account with private DNS disabled.
+    - In that setup, calling the plain `{api-id}.execute-api...` name through a central DNS zone can return `403 {"message":"Forbidden"}`.
   - Earlier versions used a Cognito M2M token, which needed a `cognito-idp` VPC endpoint the VPC didn't have.
 - **Private API** keeps the resource policy that denies anything not arriving through your execute-api endpoint, so a request needs both the right network path and a valid signature.
 - **Gateway auth:** inbound `AWS_IAM` (only the runtime role can invoke it; the agent SigV4-signs MCP calls), outbound `GATEWAY_IAM_ROLE` (the gateway role can invoke only the tool Lambda).

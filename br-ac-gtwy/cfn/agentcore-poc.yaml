@@ -1025,7 +1025,10 @@ Resources:
         SecurityGroupIds: [!Ref WorkloadSecurityGroup]
       Environment:
         Variables:
-          API_BASE_URL: !Sub "https://${CustomerApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+          # API-specific endpoint hostname ({api-id}-{vpce-id}). Routes to this API through the
+          # associated execute-api endpoint even when that endpoint is shared from another account
+          # and has private DNS disabled (the plain {api-id}.execute-api name then returns 403 Forbidden).
+          API_BASE_URL: !Sub "https://${CustomerApi}-${ExecuteApiVpceId}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
           LOG_LEVEL: INFO              # DEBUG adds botocore wire-level logs
       Code:
         ZipFile: |
@@ -1405,8 +1408,8 @@ Outputs:
   CustomerApiId:
     Value: !Ref CustomerApi
   CustomerApiBaseUrl:
-    Description: Resolves only inside the VPC (execute-api private DNS)
-    Value: !Sub "https://${CustomerApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+    Description: API-specific endpoint URL ({api-id}-{vpce-id}); reachable only inside the VPC through the execute-api endpoint
+    Value: !Sub "https://${CustomerApi}-${ExecuteApiVpceId}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
   CustomersTableName:
     Value: !Ref CustomersTable
   ToolFunctionName:
