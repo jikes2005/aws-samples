@@ -6,10 +6,14 @@ import httpx
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from bedrock_agentcore import BedrockAgentCoreApp
-from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
+
+try:  # Strands helper that works with both mcp 1.x and mcp 2.x
+    from strands.tools.mcp._compat import streamable_http_transport
+except ImportError:  # older Strands (mcp 1.x only)
+    from mcp.client.streamable_http import streamablehttp_client as streamable_http_transport
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("customer_agent")
@@ -64,7 +68,7 @@ def invoke(payload):
                   or payload.get("message") or "Hello!")
 
     # Tools come from AgentCore Gateway (MCP). Open a connection for this request.
-    with MCPClient(lambda: streamablehttp_client(GATEWAY_URL, auth=GatewayAuth())) as gateway:
+    with MCPClient(lambda: streamable_http_transport(GATEWAY_URL, auth=GatewayAuth())) as gateway:
         tools = gateway.list_tools_sync()
         log.info("Gateway tools: %s", [t.tool_name for t in tools])
 

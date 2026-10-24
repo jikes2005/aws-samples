@@ -35,7 +35,7 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and 
 |---|---|
 | `cfn/agentcore-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB (PITR + on-demand backup), Cognito (pool, resource server, custom-resource app client), seed custom resource, private REST API + Cognito authorizer, API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
 | `agent/customer_agent.py` | Strands agent; loads tools from the gateway over MCP with SigV4 auth |
-| `agent/requirements.txt` | Agent dependencies, pinned to tested major versions (`mcp` stays on 1.x) |
+| `agent/requirements.txt` | Agent dependencies. The agent works with `mcp` 1.x and 2.x |
 | `agent/build_agent.ipynb` | Builds the arm64 agent zip in SageMaker AI, uploads it to S3, optionally updates the stack and tests the agent |
 | `scripts/deploy.sh` | Packages the agent for linux/arm64, uploads it to S3, deploys the stack, redeploys the API stage |
 | `scripts/invoke.py` | Calls the runtime with a prompt from your laptop |
@@ -92,7 +92,7 @@ Upload the `agent/` folder to a SageMaker AI notebook instance or Studio Jupyter
 
 1. **Configure:** set `PROJECT` and `ARTIFACT_BUCKET` (blank uses the SageMaker default bucket).
 2. **Install:** installs dependencies for linux/arm64, Python 3.12, using arm64 wheels only. The SageMaker instance is usually x86_64, so nothing is compiled locally.
-3. **Check:** syntax-checks `customer_agent.py`, then confirms every native extension is an aarch64 build and `mcp` is 1.x.
+3. **Check:** syntax-checks `customer_agent.py`, then confirms every native extension is an aarch64 build.
 4. **Zip and upload:** writes `agent.zip` with `customer_agent.py` at the root and uploads it under a new versioned key. It prints the key to use as `AgentCodeKey`.
 5. **Update stack** (`DEPLOY_STACK = True`): updates the existing stack, changing only `ArtifactBucket` and `AgentCodeKey`. Every other parameter keeps its previous value.
 6. **Test** (`RUN_TEST = True`): invokes the agent. You can also call `ask("...")` from any cell.
