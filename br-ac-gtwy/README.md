@@ -77,6 +77,7 @@ export ARTIFACT_BUCKET=my-artifacts-bucket
 # export SUPPORT_TEAM=CLOUD
 # export ENVIRONMENT=dev
 # export KMS_KEY_ARN=arn:aws:kms:...:key/...   # use an existing CMK (blank = stack creates one)
+# export APPLY_COMMON_WAF=false                # ApplyCommonWaf tag on the API stage (default true)
 # export CREATE_APIGW_ACCOUNT_ROLE=true        # only if the account has no API Gateway CloudWatch role
 ./scripts/deploy.sh
 ```
@@ -158,7 +159,7 @@ The account runs a CloudFormation hook that scans **the template itself**, befor
 
 | Hook finding | Fix in the template |
 |---|---|
-| API.31 – stage tagged `ApplyCommonWaf` | Literal `"true"` tag on `ApiStage` |
+| API.31 – stage tagged `ApplyCommonWaf` | Stage tag from the `ApplyCommonWaf` parameter (`true`/`false`, default `true`). If the hook fails API.31 again, replace `!Ref ApplyCommonWaf` with a literal `"true"` or `"false"`. The hook appears to scan the template before parameters are resolved |
 | DDB.14 – deletion protection | `DeletionProtectionEnabled: true` on the table. `TableDeletionGuard` lifts it only when the stack is deleted |
 | Lam.23 – Lambda in a VPC (warning) | The API and tool Lambdas run in the VPC. `deploy-helper` intentionally doesn't (see *Why the deploy helper runs outside the VPC*), so this stays a non-blocking warning for that one function |
 | Required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (20). `Description` is per resource. The others come from parameters |
@@ -172,7 +173,7 @@ Resources that can't take tags are skipped: custom resources, API methods and re
 | Customer managed KMS key everywhere it's supported | One CMK (rotation on), or bring your own via `ExistingKmsKeyArn`. See coverage below | CKV_AWS_119, 158, 173, 7 |
 | DynamoDB encrypted with the CMK | `SSEType: KMS` + `KMSMasterKeyId` | CKV_AWS_119 |
 | On-demand backup configured | `dynamodbbackup: "True"` tag (org backup policy), PITR, and a native DynamoDB on-demand backup taken at deploy (`Custom::DynamoDbOnDemandBackup`). The stack has no AWS Backup vault or plan of its own | CKV_AWS_28 |
-| API stage tagged `ApplyCommonWaf` | Literal `"true"` on the stage's tags. It's not a parameter, because the org hook scans the template and can't resolve `!Ref`. Edit the value to `"false"` if needed | API.31 |
+| API stage tagged `ApplyCommonWaf` | Stage tag from the `ApplyCommonWaf` parameter (`true`/`false`, default `true`). `"true"` lets the org attach its common WAF web ACL to the stage. If that WAF blocks the tool Lambda's calls with `403 Forbidden`, deploy with `false` | API.31 |
 | X-Ray tracing on the API stage | `TracingEnabled: true` | CKV_AWS_73 |
 | API Gateway access logging | JSON access logs to a CMK-encrypted log group, 90-day retention | CKV_AWS_76 |
 

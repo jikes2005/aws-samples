@@ -20,6 +20,7 @@ SUPPORT_TEAM="${SUPPORT_TEAM:-CLOUD}"
 SERVICE_NAME="${SERVICE_NAME:-AgentCore POC}"
 ENVIRONMENT="${ENVIRONMENT:-dev}"
 KMS_KEY_ARN="${KMS_KEY_ARN:-}"           # blank = stack creates its own CMK
+APPLY_COMMON_WAF="${APPLY_COMMON_WAF:-true}"   # ApplyCommonWaf tag on the API stage ("true"/"false")
 CREATE_APIGW_ACCOUNT_ROLE="${CREATE_APIGW_ACCOUNT_ROLE:-false}"  # true only if the account has no API GW CloudWatch role
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -55,7 +56,7 @@ aws cloudformation deploy --region "$REGION" \
   --parameter-overrides ProjectName="$PROJECT" StageName="$STAGE" \
     VpcId="$VPC_ID" PrivateSubnetIds="$SUBNET_IDS" ExecuteApiVpceId="$EXECUTE_API_VPCE" \
     AppCatID="$APP_CAT_ID" SupportTeam="$SUPPORT_TEAM" ServiceName="$SERVICE_NAME" Environment="$ENVIRONMENT" \
-    ExistingKmsKeyArn="$KMS_KEY_ARN" \
+    ExistingKmsKeyArn="$KMS_KEY_ARN" ApplyCommonWaf="$APPLY_COMMON_WAF" \
     CreateApiGatewayAccountRole="$CREATE_APIGW_ACCOUNT_ROLE" \
     ArtifactBucket="$ARTIFACT_BUCKET" AgentCodeKey="$CODE_KEY" ModelId="$MODEL_ID" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset

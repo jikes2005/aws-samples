@@ -15,7 +15,7 @@ Metadata:
       - Label: { default: Agent }
         Parameters: [ArtifactBucket, AgentCodeKey, ModelId]
       - Label: { default: "Encryption, backup and API controls" }
-        Parameters: [ExistingKmsKeyArn, CreateApiGatewayAccountRole]
+        Parameters: [ExistingKmsKeyArn, ApplyCommonWaf, CreateApiGatewayAccountRole]
       - Label: { default: Required tags }
         Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
       - Label: { default: General }
@@ -55,6 +55,13 @@ Parameters:
     Description: >
       Leave blank to create a customer managed key for this stack. To use an existing CMK,
       give its key ARN (not an alias) and add the key policy statements from the README.
+  ApplyCommonWaf:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      Value of the ApplyCommonWaf tag on the API stage. "true" lets the organisation attach its
+      common WAF web ACL to the stage; "false" opts this stage out.
   CreateApiGatewayAccountRole:
     Type: String
     AllowedValues: ["true", "false"]
@@ -911,7 +918,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
         - Key: ApplyCommonWaf
-          Value: "true"   # literal on purpose: set "true" or "false"
+          Value: !Ref ApplyCommonWaf
       RestApiId: !Ref CustomerApi
       DeploymentId: !Ref ApiDeployment
       StageName: !Ref StageName
@@ -927,6 +934,7 @@ Resources:
           "sourceIp":"$context.identity.sourceIp","vpceId":"$context.identity.vpceId",
           "caller":"$context.identity.userArn","callerAccount":"$context.identity.accountId",
           "xrayTraceId":"$context.xrayTraceId","errorMessage":"$context.error.message",
+          "wafResponseCode":"$context.wafResponseCode","webAclArn":"$context.webaclArn",
           "authError":"$context.error.responseType"}
       MethodSettings:
         - ResourcePath: "/*"
