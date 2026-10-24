@@ -33,7 +33,7 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-mcp-poc.yaml`) 
 
 | Path | What it is |
 |---|---|
-| `cfn/agentcore-mcp-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB + AWS Backup, Cognito (pool, resource server, custom-resource app client), seed custom resource, private REST API + Cognito authorizer, API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
+| `cfn/agentcore-mcp-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB (PITR + on-demand backup), Cognito (pool, resource server, custom-resource app client), seed custom resource, private REST API + Cognito authorizer, API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
 | `agent/main.py` | Strands agent; loads tools from the gateway over MCP with SigV4 auth |
 | `agent/requirements.txt` | Agent dependencies, pinned to tested major versions (`mcp` stays on 1.x) |
 | `agent/build_agent.ipynb` | Builds the arm64 agent zip in SageMaker AI, uploads it to S3, optionally updates the stack and tests the agent |
@@ -70,12 +70,12 @@ export VPC_ID=vpc-xxxxxxxx
 export SUBNET_IDS=subnet-aaaa,subnet-bbbb
 export EXECUTE_API_VPCE=vpce-xxxxxxxx
 export ARTIFACT_BUCKET=my-artifacts-bucket
-export APP_CAT_ID=APP12345         # required tag AppCatID
-export SUPPORT_TEAM=my-team        # required tag Support-Team
-# export SERVICE_NAME="AgentCore MCP POC"      # tag ServiceName (default shown)
-# export ENVIRONMENT=dev                       # tag Environment (default dev)
+# Tag values (defaults shown):
+# export APP_CAT_ID=12345
+# export SERVICE_NAME="AgentCore POC"
+# export SUPPORT_TEAM=CLOUD
+# export ENVIRONMENT=dev
 # export KMS_KEY_ARN=arn:aws:kms:...:key/...   # use an existing CMK (blank = stack creates one)
-# export BACKUP_RETENTION_DAYS=35
 # export CREATE_APIGW_ACCOUNT_ROLE=true        # only if the account has no API Gateway CloudWatch role
 ./scripts/deploy.sh
 ```
@@ -148,22 +148,22 @@ The account runs a CloudFormation hook that scans **the template itself**, befor
 | API.31 – stage tagged `ApplyCommonWaf` | Literal `"true"` tag on `ApiStage` |
 | DDB.14 – deletion protection | `DeletionProtectionEnabled: true` on the table |
 | Lam.23 – Lambda in a VPC | The deploy helper always runs in the VPC (the earlier opt-out was removed) |
-| BMO.01 – required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (24). `Description` is per resource. The others come from parameters |
-| DDB.11 – on-demand backup | AWS Backup plan + native on-demand backup are in place. The hook's exact expectation is still being confirmed |
+| Required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (24). `Description` is per resource. The others come from parameters |
+| DDB.11 – on-demand backup | Literal tag `dynamodbbackup: "True"` on the table. The hook checks the tag, which enrols the table in the organisation's backup policy (confirm with your platform team) |
 
-Resources that can't take tags are skipped: custom resources, API methods and resources, the authorizer, deployment, Lambda permission, KMS alias, backup selection and gateway target.
+Resources that can't take tags are skipped: custom resources, API methods and resources, the authorizer, deployment, Lambda permission, KMS alias and gateway target.
 
 
 | Requirement | How it's met | Scanner check (Checkov) |
 |---|---|---|
-| Customer managed KMS key everywhere it's supported | One CMK (rotation on), or bring your own via `ExistingKmsKeyArn`. See coverage below | CKV_AWS_119, 158, 166, 173, 7 |
+| Customer managed KMS key everywhere it's supported | One CMK (rotation on), or bring your own via `ExistingKmsKeyArn`. See coverage below | CKV_AWS_119, 158, 173, 7 |
 | DynamoDB encrypted with the CMK | `SSEType: KMS` + `KMSMasterKeyId` | CKV_AWS_119 |
-| On-demand backup configured | AWS Backup daily plan into a CMK-encrypted vault (`BackupRetentionDays`, default 35), **plus** a native DynamoDB on-demand backup taken at deploy (`Custom::DynamoDbOnDemandBackup`). PITR stays on | CKV_AWS_166, CKV_AWS_28 |
+| On-demand backup configured | `dynamodbbackup: "True"` tag (org backup policy), PITR, and a native DynamoDB on-demand backup taken at deploy (`Custom::DynamoDbOnDemandBackup`). The stack has no AWS Backup vault or plan of its own | CKV_AWS_28 |
 | API stage tagged `ApplyCommonWaf` | Literal `"true"` on the stage's tags. It's not a parameter, because the org hook scans the template and can't resolve `!Ref`. Edit the value to `"false"` if needed | API.31 |
 | X-Ray tracing on the API stage | `TracingEnabled: true` | CKV_AWS_73 |
 | API Gateway access logging | JSON access logs to a CMK-encrypted log group, 90-day retention | CKV_AWS_76 |
 
-Checkov 3.x result for the template: **90 passed, 7 failed**. None of the failures are in the list above. They are Lambda dead-letter queues and reserved concurrency (CKV_AWS_116/115) and API caching (CKV_AWS_120). Dead-letter queues only apply to async invocations, and these Lambdas are called synchronously.
+Checkov 3.x result for the template: **82 passed, 7 failed**. None of the failures are in the list above. They are Lambda dead-letter queues and reserved concurrency (CKV_AWS_116/115) and API caching (CKV_AWS_120). Dead-letter queues only apply to async invocations, and these Lambdas are called synchronously.
 
 **About "API Gateway V2" access logging:** this stack has no API Gateway V2 (HTTP/WebSocket) API. The customer API is a REST API (v1), because only REST APIs support the `PRIVATE` endpoint type. Access logging is enabled on that REST stage, which satisfies the v1 rule (CKV_AWS_76). The V2 rule (CKV_AWS_95) only applies to `AWS::ApiGatewayV2::Stage`, so it has nothing to evaluate here.
 
@@ -172,7 +172,6 @@ Checkov 3.x result for the template: **90 passed, 7 failed**. None of the failur
 | Resource | Encryption |
 |---|---|
 | DynamoDB table | CMK |
-| AWS Backup vault (scheduled recovery points) | CMK |
 | DynamoDB on-demand backups | CMK (inherits the table's key) |
 | CloudWatch log groups (3 Lambdas + API access logs) | CMK |
 | Lambda environment variables (3 functions) | CMK |
@@ -183,16 +182,20 @@ Checkov 3.x result for the template: **90 passed, 7 failed**. None of the failur
 | API Gateway | No data at rest (no cache configured) |
 | Agent zip in S3 | Your existing bucket's encryption settings |
 
-The key policy grants:
+The key policy has two statements:
 
 - **Account root:** enables IAM policies on the key.
 - **CloudWatch Logs:** scoped to this account's log groups.
-- **Gateway service role:** scoped to `bedrock-agentcore` and an encryption context of this account's gateway ARNs.
-- **AWS Backup role:** via the `backup` and `dynamodb` services.
 
-The two roles that access the table get key use through `dynamodb.<region>.amazonaws.com` only, granted in IAM. There's no wildcard principal. None of these calls go from the VPC to KMS, so you don't need a KMS endpoint.
+Every role gets key use through its own IAM policy on this one key:
 
-**Using an existing CMK (`ExistingKmsKeyArn`):** the stack can't edit that key's policy. Add the CloudWatch Logs, AgentCore Gateway and AWS Backup statements from the `KmsKey` resource yourself, using this stack's `GatewayRole` and `BackupRole` ARNs.
+- **Gateway service role** (`GatewayKmsPolicy`): `DescribeKey`, `Decrypt`, `GenerateDataKey`, `CreateGrant`. This is required at gateway creation. A key-policy grant with `kms:ViaService` and encryption-context conditions was rejected with "no identity-based policy allows kms:GenerateDataKey".
+- **The two roles that access the table:** through `dynamodb.<region>.amazonaws.com` only.
+- **The three Lambda roles:** `Decrypt`, for their environment variables.
+
+There's no wildcard principal. None of these calls go from the VPC to KMS, so you don't need a KMS endpoint.
+
+**Using an existing CMK (`ExistingKmsKeyArn`):** its key policy must enable IAM policies (the standard account-root statement) and allow CloudWatch Logs for this account's log groups. The stack's IAM policies cover everything else.
 
 ### Access-logging prerequisite
 
@@ -200,8 +203,11 @@ API Gateway access logging needs a CloudWatch Logs role set at the **account lev
 
 ### Backups
 
-- **Scheduled:** the AWS Backup plan runs daily at 06:00 UTC.
-- **On demand:** to take another native on-demand backup, bump `BackupVersion` on the `OnDemandBackup` resource and redeploy. Or run `aws dynamodb create-backup` or `aws backup start-backup-job` at any time.
+DynamoDB's own backups don't need AWS Backup or a vault.
+
+- **Scheduled:** handled by your organisation's AWS Backup policy, via the `dynamodbbackup: "True"` tag. Those recovery points live in the org's vault, not in this stack.
+- **Continuous:** PITR lets you restore to any second in the last 35 days.
+- **On demand:** to take another native on-demand backup, bump `BackupVersion` on the `OnDemandBackup` resource and redeploy, or run `aws dynamodb create-backup` at any time.
 - **Retention:** native on-demand backups don't expire; delete them when they're no longer needed.
 
 ## Design notes
@@ -233,7 +239,6 @@ The custom resource deletes the app client before the user pool goes. Lambda VPC
 **Retained on purpose**, so backups stay usable after the stack is gone:
 
 - **The KMS key and its alias:** schedule deletion with `aws kms schedule-key-deletion` when you're done.
-- **The backup vault:** delete its recovery points first, then the vault.
 - **Native DynamoDB on-demand backups:** `aws dynamodb list-backups`, then `delete-backup`.
 - **The account-level API Gateway CloudWatch role setting,** if the stack created it.
 

@@ -15,7 +15,7 @@ Metadata:
       - Label: { default: Agent }
         Parameters: [ArtifactBucket, AgentCodeKey, ModelId]
       - Label: { default: "Encryption, backup and API controls" }
-        Parameters: [ExistingKmsKeyArn, BackupRetentionDays, CreateApiGatewayAccountRole]
+        Parameters: [ExistingKmsKeyArn, CreateApiGatewayAccountRole]
       - Label: { default: Required tags }
         Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
       - Label: { default: General }
@@ -55,12 +55,6 @@ Parameters:
     Description: >
       Leave blank to create a customer managed key for this stack. To use an existing CMK,
       give its key ARN (not an alias) and add the key policy statements from the README.
-  BackupRetentionDays:
-    Type: Number
-    Default: 35
-    MinValue: 1
-    MaxValue: 3650
-    Description: Retention for the daily AWS Backup recovery points
   CreateApiGatewayAccountRole:
     Type: String
     AllowedValues: ["true", "false"]
@@ -70,25 +64,23 @@ Parameters:
       settings (one per account and region). Set true ONLY if the account has none - this
       overwrites the existing account setting.
 
-  # ---- Required organisation tags (BMO.01) ----
+  # ---- Required tags ----
   AppCatID:
     Type: String
     MinLength: 1
-    Description: Application catalogue ID (AppCatID tag)
+    Default: 12345
   ServiceName:
     Type: String
-    Default: AgentCore MCP POC
+    Default: AgentCore POC
     MinLength: 1
-    Description: ServiceName tag
   SupportTeam:
     Type: String
     MinLength: 1
-    Description: Support-Team tag
+    Default: "CLOUD"
   Environment:
     Type: String
     Default: dev
     MinLength: 1
-    Description: Environment tag
 
 Conditions:
   CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
@@ -96,14 +88,16 @@ Conditions:
 
 Resources:
   # =====================================================================
-  # Customer managed KMS key - used by DynamoDB, AWS Backup, CloudWatch log
+  # Customer managed KMS key - used by DynamoDB (incl. its backups), CloudWatch log
   # groups (incl. API access logs), Lambda environment variables and the
   # AgentCore Gateway. Skipped when ExistingKmsKeyArn is set.
+  # The gateway service role gets key use through an IAM policy (GatewayKmsPolicy),
+  # enabled by the EnableIamPolicies statement.
   # =====================================================================
   KmsKey:
     Type: AWS::KMS::Key
     Condition: CreateKmsKey
-    DeletionPolicy: Retain             # keep the key so retained backups stay readable
+    DeletionPolicy: Retain             # keep the key so on-demand backups stay readable
     UpdateReplacePolicy: Retain
     Properties:
       Tags:
@@ -138,47 +132,6 @@ Resources:
             Condition:
               ArnLike:
                 kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
-          - Sid: AgentCoreGatewayDescribeKey
-            Effect: Allow
-            Principal: { AWS: !GetAtt GatewayRole.Arn }
-            Action: kms:DescribeKey
-            Resource: "*"
-            Condition:
-              StringEquals:
-                kms:ViaService: !Sub "bedrock-agentcore.${AWS::Region}.amazonaws.com"
-          - Sid: AgentCoreGatewayUseKey
-            Effect: Allow
-            Principal: { AWS: !GetAtt GatewayRole.Arn }
-            Action: [kms:Decrypt, kms:GenerateDataKey]
-            Resource: "*"
-            Condition:
-              StringEquals:
-                kms:ViaService: !Sub "bedrock-agentcore.${AWS::Region}.amazonaws.com"
-              StringLike:
-                kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
-          - Sid: AgentCoreGatewayCreateGrant
-            Effect: Allow
-            Principal: { AWS: !GetAtt GatewayRole.Arn }
-            Action: kms:CreateGrant
-            Resource: "*"
-            Condition:
-              StringEquals:
-                kms:ViaService: !Sub "bedrock-agentcore.${AWS::Region}.amazonaws.com"
-                kms:GrantConstraintType: EncryptionContextSubset
-              ForAllValues:StringEquals:
-                kms:GrantOperations: [Decrypt, GenerateDataKey]
-              StringLike:
-                kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
-          - Sid: AwsBackup
-            Effect: Allow
-            Principal: { AWS: !GetAtt BackupRole.Arn }
-            Action: [kms:Decrypt, kms:GenerateDataKey*, kms:ReEncrypt*, kms:DescribeKey, kms:CreateGrant]
-            Resource: "*"
-            Condition:
-              StringEquals:
-                kms:ViaService:
-                  - !Sub "backup.${AWS::Region}.amazonaws.com"
-                  - !Sub "dynamodb.${AWS::Region}.amazonaws.com"
 
   KmsKeyAlias:
     Type: AWS::KMS::Alias
@@ -230,6 +183,8 @@ Resources:
           Value: !Ref AppCatID
         - Key: Description
           Value: "Customer records for the sample API"
+        - Key: dynamodbbackup          # DDB.11 - org backup policy; literal so the hook can read it
+          Value: "True"
         - Key: ServiceName
           Value: !Ref ServiceName
         - Key: Support-Team
@@ -258,78 +213,6 @@ Resources:
         SSEEnabled: true
         SSEType: KMS
         KMSMasterKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-
-  # ---------------- AWS Backup (scheduled backups, CMK-encrypted vault) ----------------
-  BackupVault:
-    Type: AWS::Backup::BackupVault
-    DeletionPolicy: Retain             # recovery points outlive the stack
-    UpdateReplacePolicy: Retain
-    Properties:
-      BackupVaultTags:
-        AppCatID: !Ref AppCatID
-        Description: "Backup vault for the customers table"
-        ServiceName: !Ref ServiceName
-        Support-Team: !Ref SupportTeam
-        Environment: !Ref Environment
-        Project: !Ref ProjectName
-      BackupVaultName: !Sub "${ProjectName}-vault"
-      EncryptionKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-
-  BackupPlan:
-    Type: AWS::Backup::BackupPlan
-    Properties:
-      BackupPlanTags:
-        AppCatID: !Ref AppCatID
-        Description: "Daily backup plan for the customers table"
-        ServiceName: !Ref ServiceName
-        Support-Team: !Ref SupportTeam
-        Environment: !Ref Environment
-        Project: !Ref ProjectName
-      BackupPlan:
-        BackupPlanName: !Sub "${ProjectName}-daily"
-        BackupPlanRule:
-          - RuleName: daily
-            TargetBackupVault: !Ref BackupVault
-            ScheduleExpression: cron(0 6 * * ? *)      # 06:00 UTC daily
-            StartWindowMinutes: 60
-            CompletionWindowMinutes: 180
-            Lifecycle:
-              DeleteAfterDays: !Ref BackupRetentionDays
-
-  BackupRole:
-    Type: AWS::IAM::Role
-    Properties:
-      Tags:
-        - Key: AppCatID
-          Value: !Ref AppCatID
-        - Key: Description
-          Value: "AWS Backup service role"
-        - Key: ServiceName
-          Value: !Ref ServiceName
-        - Key: Support-Team
-          Value: !Ref SupportTeam
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: !Ref ProjectName
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: backup.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
-        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
-
-  BackupSelection:
-    Type: AWS::Backup::BackupSelection
-    Properties:
-      BackupPlanId: !Ref BackupPlan
-      BackupSelection:
-        SelectionName: customers-table
-        IamRoleArn: !GetAtt BackupRole.Arn
-        Resources: [!GetAtt CustomersTable.Arn]
 
   # =====================================================================
   # Cognito (machine-to-machine). No user pool domain on purpose: a domain
@@ -1244,8 +1127,24 @@ Resources:
                 Action: lambda:InvokeFunction
                 Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-customer-tools"
 
+  # The gateway encrypts its configuration with the CMK using its service role.
+  # Granted in IAM: a key-policy grant with kms:ViaService/encryption-context
+  # conditions was rejected at create time ("no identity-based policy allows").
+  GatewayKmsPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref GatewayRole
+      PolicyName: use-stack-cmk
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [kms:DescribeKey, kms:Decrypt, kms:GenerateDataKey, kms:CreateGrant]
+            Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
   McpGateway:
     Type: AWS::BedrockAgentCore::Gateway
+    DependsOn: GatewayKmsPolicy
     Properties:
       Tags:
         AppCatID: !Ref AppCatID
@@ -1426,8 +1325,6 @@ Outputs:
   KmsKeyArn:
     Description: Customer managed key used by this stack
     Value: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-  BackupVaultName:
-    Value: !Ref BackupVault
   OnDemandBackupArn:
     Value: !Ref OnDemandBackup
   ApiAccessLogGroup:
