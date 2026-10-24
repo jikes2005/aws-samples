@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  AgentCore MCP POC (single stack). Uses an EXISTING VPC, subnets and VPC endpoints.
+  AgentCore POC (single stack). Uses an EXISTING VPC, subnets and VPC endpoints.
   Strands agent on AgentCore Runtime -> AgentCore Gateway (MCP) -> tool Lambda ->
   private API Gateway (Cognito M2M authorizer) -> Lambda -> DynamoDB.
   Custom resources create the Cognito app client (ALLOW_CLIENT_TOKEN_AUTH), seed sample data
@@ -15,7 +15,7 @@ Metadata:
       - Label: { default: Agent }
         Parameters: [ArtifactBucket, AgentCodeKey, ModelId]
       - Label: { default: "Encryption, backup and API controls" }
-        Parameters: [ExistingKmsKeyArn, CreateApiGatewayAccountRole]
+        Parameters: [ExistingKmsKeyArn, CreateApiGatewayAccountRole, TestFunctionInVpc]
       - Label: { default: Required tags }
         Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
       - Label: { default: General }
@@ -24,7 +24,7 @@ Metadata:
 Parameters:
   ProjectName:
     Type: String
-    Default: agentcore-mcp-poc
+    Default: agentcore-poc
     AllowedPattern: "^[a-z][a-z0-9-]{2,29}$"
   StageName:
     Type: String
@@ -55,6 +55,13 @@ Parameters:
     Description: >
       Leave blank to create a customer managed key for this stack. To use an existing CMK,
       give its key ARN (not an alias) and add the key policy statements from the README.
+  TestFunctionInVpc:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      Run the agent test Lambda in the VPC. Needs the AgentCore data-plane interface
+      endpoint (com.amazonaws.<region>.bedrock-agentcore). Set false if the VPC doesn't have it.
   CreateApiGatewayAccountRole:
     Type: String
     AllowedValues: ["true", "false"]
@@ -85,6 +92,7 @@ Parameters:
 Conditions:
   CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
   CreateApiGwAccount: !Equals [!Ref CreateApiGatewayAccountRole, "true"]
+  TestFnInVpc: !Equals [!Ref TestFunctionInVpc, "true"]
 
 Resources:
   # =====================================================================
@@ -97,8 +105,8 @@ Resources:
   KmsKey:
     Type: AWS::KMS::Key
     Condition: CreateKmsKey
-    DeletionPolicy: Retain             # keep the key so on-demand backups stay readable
-    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete             # stack delete schedules key deletion (7-day minimum KMS wait)
+    UpdateReplacePolicy: Delete
     Properties:
       Tags:
         - Key: AppCatID
@@ -115,7 +123,7 @@ Resources:
           Value: !Ref ProjectName
       Description: !Sub "${ProjectName} - CMK for data at rest"
       EnableKeyRotation: true
-      PendingWindowInDays: 30
+      PendingWindowInDays: 7
       KeyPolicy:
         Version: "2012-10-17"
         Statement:
@@ -175,7 +183,7 @@ Resources:
   # =====================================================================
   CustomersTable:
     Type: AWS::DynamoDB::Table
-    DeletionPolicy: Delete          # POC - use Retain for real data
+    DeletionPolicy: Delete          # deleted with the stack (TableDeletionGuard lifts deletion protection first)
     UpdateReplacePolicy: Delete
     Properties:
       Tags:
@@ -272,7 +280,7 @@ Resources:
             Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
         - PolicyName: deploy-helper
           PolicyDocument:
@@ -286,8 +294,19 @@ Resources:
                   - cognito-idp:DescribeUserPoolClient
                 Resource: !GetAtt UserPool.Arn
               - Effect: Allow
-                Action: [dynamodb:PutItem, dynamodb:CreateBackup]
+                Action: [dynamodb:PutItem, dynamodb:CreateBackup, dynamodb:UpdateTable, dynamodb:DescribeTable]
                 Resource: !GetAtt CustomersTable.Arn
+              - Effect: Allow
+                Action: dynamodb:DeleteBackup
+                Resource: !Sub "${CustomersTable.Arn}/backup/*"
+              - Sid: RuntimeLogCleanup
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: RuntimeLogCleanupDelete
+                Effect: Allow
+                Action: logs:DeleteLogGroup
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
               - Sid: UseCmkViaDynamoDb
                 Effect: Allow
                 Action: [kms:Encrypt, kms:Decrypt, kms:ReEncrypt*, kms:GenerateDataKey*, kms:DescribeKey, kms:CreateGrant]
@@ -338,7 +357,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
       FunctionName: !Sub "${ProjectName}-deploy-helper"
-      Description: CloudFormation custom resources (Cognito M2M client, data seed)
+      Description: CloudFormation custom resources (Cognito client, seed, backup, delete-time cleanup)
       Runtime: python3.12
       Architectures: [arm64]
       Handler: index.handler
@@ -346,14 +365,13 @@ Resources:
       MemorySize: 256
       Role: !GetAtt DeployHelperRole.Arn
       KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-      # Always in the VPC (org policy). Needs the S3 gateway endpoint to send its
-      # result to CloudFormation's pre-signed S3 URL.
-      VpcConfig:
-        SubnetIds: !Ref PrivateSubnetIds
-        SecurityGroupIds: [!Ref WorkloadSecurityGroup]
+      # Deliberately NOT in the VPC (same pattern as the RAG POC's schema-init Lambda).
+      # It only runs at deploy time, calls Cognito and DynamoDB control-plane APIs, and must
+      # PUT its result to CloudFormation's pre-signed S3 URL, which these private subnets
+      # can't resolve. The org hook reports this as a warning (Lam.23), not an error.
       Code:
         ZipFile: |
-          import json, re, urllib.request
+          import json, re, time, threading, urllib.request
           from decimal import Decimal
           import boto3
           from botocore.exceptions import ClientError
@@ -371,8 +389,15 @@ Resources:
               }).encode()
               req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
                                            headers={"Content-Type": "", "Content-Length": str(len(body))})
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  print(f"CloudFormation response {status} -> HTTP {r.status}")
+              for attempt in range(5):
+                  try:
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          print(f"CloudFormation response {status} -> HTTP {r.status}")
+                          return
+                  except Exception as e:
+                      print(f"Failed to send CloudFormation response (attempt {attempt + 1}/5): {e}")
+                      time.sleep(2)
+              print("Gave up sending the CloudFormation response; the stack will wait for ServiceTimeout")
 
           # ---------- Custom::CognitoM2MClient ----------
           def _client_cfg(p):
@@ -447,10 +472,19 @@ Resources:
           # ---------- Custom::DynamoDbOnDemandBackup ----------
           def on_demand_backup(event):
               # Native DynamoDB on-demand backup (encrypted with the table's CMK). Taken on
-              # create and whenever BackupVersion changes. Backups are kept on stack delete.
+              # create and whenever BackupVersion changes. Deleted on stack delete; when
+              # BackupVersion changes, CloudFormation deletes the previous backup.
               p = event["ResourceProperties"]
               if event["RequestType"] == "Delete":
-                  return event.get("PhysicalResourceId", "backup"), {}
+                  pid = event.get("PhysicalResourceId", "")
+                  if pid.startswith("arn:"):
+                      try:
+                          boto3.client("dynamodb").delete_backup(BackupArn=pid)
+                          print(f"Deleted backup {pid}")
+                      except ClientError as e:
+                          if e.response["Error"]["Code"] not in ("BackupNotFoundException", "ResourceNotFoundException"):
+                              raise
+                  return pid or "backup", {}
               old = event.get("OldResourceProperties", {})
               if event["RequestType"] == "Update" and old.get("BackupVersion") == p.get("BackupVersion"):
                   return event["PhysicalResourceId"], {}
@@ -459,19 +493,77 @@ Resources:
               arn = b["BackupDetails"]["BackupArn"]
               return arn, {"BackupArn": arn}
 
+          # ---------- Custom::TableDeletionGuard ----------
+          def table_deletion_guard(event):
+              # Deletion protection stays ON for the table's life. This resource depends on
+              # the table, so CloudFormation deletes it first: we turn protection off and
+              # wait for ACTIVE so the table delete that follows succeeds.
+              p = event["ResourceProperties"]
+              pid = f"deletion-guard-{p['TableName']}"
+              if event["RequestType"] != "Delete":
+                  return pid, {}
+              ddb = boto3.client("dynamodb")
+              try:
+                  ddb.update_table(TableName=p["TableName"], DeletionProtectionEnabled=False)
+                  ddb.get_waiter("table_exists").wait(TableName=p["TableName"],
+                                                      WaiterConfig={"Delay": 2, "MaxAttempts": 45})
+                  print(f"Deletion protection disabled on {p['TableName']}")
+              except ClientError as e:
+                  if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                      raise
+              return pid, {}
+
+          # ---------- Custom::RuntimeLogCleanup ----------
+          def runtime_log_cleanup(event):
+              # AgentCore Runtime creates /aws/bedrock-agentcore/runtimes/<name>-<suffix>-<endpoint>
+              # itself, so CloudFormation doesn't own it. The runtime depends on this resource,
+              # so on stack delete this runs after the runtime is gone.
+              p = event["ResourceProperties"]
+              name = p["RuntimeName"]
+              prefix = f"/aws/bedrock-agentcore/runtimes/{name}-"
+              if event["RequestType"] != "Delete":
+                  return f"log-cleanup-{name}", {"RuntimeName": name}
+              logs = boto3.client("logs")
+              for page in logs.get_paginator("describe_log_groups").paginate(logGroupNamePrefix=prefix):
+                  for g in page["logGroups"]:
+                      try:
+                          logs.delete_log_group(logGroupName=g["logGroupName"])
+                          print(f"Deleted log group {g['logGroupName']}")
+                      except ClientError as e:
+                          if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                              raise
+              return event.get("PhysicalResourceId", f"log-cleanup-{name}"), {}
+
           HANDLERS = {"Custom::CognitoM2MClient": cognito_client, "Custom::SeedCustomers": seed,
-                      "Custom::DynamoDbOnDemandBackup": on_demand_backup}
+                      "Custom::DynamoDbOnDemandBackup": on_demand_backup,
+                      "Custom::TableDeletionGuard": table_deletion_guard,
+                      "Custom::RuntimeLogCleanup": runtime_log_cleanup}
 
           def handler(event, context):
               safe = {k: v for k, v in event.items() if k != "ResponseURL"}
               print(json.dumps(safe))
               pid = event.get("PhysicalResourceId") or f"failed-{event['RequestId']}"
+              done = threading.Event()
+
+              def respond(status, physical_id, data=None, reason=None):
+                  if done.is_set():
+                      return
+                  done.set()
+                  send(event, context, status, physical_id, data, reason)
+
+              # Safety net: always answer CloudFormation before Lambda kills the invocation.
+              guard = threading.Timer(max(context.get_remaining_time_in_millis() / 1000 - 20, 1),
+                                      lambda: respond("FAILED", pid, reason="Timed out - see deploy-helper logs"))
+              guard.daemon = True
+              guard.start()
               try:
-                  pid, data = HANDLERS[event["ResourceType"]](event)
-                  send(event, context, "SUCCESS", pid, data)
+                  new_pid, data = HANDLERS[event["ResourceType"]](event)
+                  respond("SUCCESS", new_pid, data)
               except Exception as e:
                   print(f"ERROR {type(e).__name__}: {e}")
-                  send(event, context, "FAILED", pid, reason=f"{type(e).__name__}: {e}")
+                  respond("FAILED", pid, reason=f"{type(e).__name__}: {e}")
+              finally:
+                  guard.cancel()
 
   CognitoM2MClient:
     Type: Custom::CognitoM2MClient
@@ -493,6 +585,23 @@ Resources:
       ServiceTimeout: 300
       TableName: !Ref CustomersTable
       SeedVersion: "1"                 # bump to re-run (existing IDs are never overwritten)
+
+  # Deletes the runtime's service-created log group (/aws/bedrock-agentcore/runtimes/<name>-*)
+  # after the runtime itself is deleted. It also supplies the runtime name (GetAtt RuntimeName).
+  RuntimeLogCleanup:
+    Type: Custom::RuntimeLogCleanup
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      RuntimeName: !Join ["_", !Split ["-", !Sub "${ProjectName}_agent"]]
+
+  # Created right after the table, so it also covers a rollback of a failed create.
+  TableDeletionGuard:
+    Type: Custom::TableDeletionGuard
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      TableName: !Ref CustomersTable
 
   OnDemandBackup:
     Type: Custom::DynamoDbOnDemandBackup
@@ -715,7 +824,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
       Name: !Sub "${ProjectName}-customer-api"
-      Description: Private customer API (Cognito-protected) for the AgentCore MCP POC
+      Description: Private customer API (Cognito-protected) for the AgentCore POC
       EndpointConfiguration:
         Types: [PRIVATE]
         VpcEndpointIds: [!Ref ExecuteApiVpceId]
@@ -870,8 +979,6 @@ Resources:
   ApiGatewayAccount:
     Type: AWS::ApiGateway::Account
     Condition: CreateApiGwAccount
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
     Properties:
       CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
 
@@ -1274,6 +1381,8 @@ Resources:
 
   AgentRuntime:
     Type: AWS::BedrockAgentCore::Runtime
+    # Name comes from RuntimeLogCleanup, so that resource is created before the runtime
+    # and deleted after it - the log group is removed once the runtime is gone.
     Properties:
       Tags:
         AppCatID: !Ref AppCatID
@@ -1282,14 +1391,14 @@ Resources:
         Support-Team: !Ref SupportTeam
         Environment: !Ref Environment
         Project: !Ref ProjectName
-      AgentRuntimeName: !Join ["_", !Split ["-", !Sub "${ProjectName}_agent"]]
+      AgentRuntimeName: !GetAtt RuntimeLogCleanup.RuntimeName
       Description: Strands agent calling customer API tools through AgentCore Gateway (MCP)
       RoleArn: !GetAtt RuntimeRole.Arn
       ProtocolConfiguration: HTTP
       AgentRuntimeArtifact:
         CodeConfiguration:
           Runtime: PYTHON_3_12
-          EntryPoint: [main.py]
+          EntryPoint: [customer_agent.py]
           Code:
             S3:
               Bucket: !Ref ArtifactBucket
@@ -1303,6 +1412,202 @@ Resources:
         GATEWAY_URL: !GetAtt McpGateway.GatewayUrl
         MODEL_ID: !Ref ModelId
         AWS_REGION_NAME: !Ref AWS::Region
+
+  # =====================================================================
+  # Agent test Lambda - invoke it to exercise the deployed agent end to end
+  #   {}                          -> runs the built-in test suite
+  #   {"prompt": "..."}           -> asks one question
+  #   {"prompts": ["...", ...]}   -> asks several questions
+  # =====================================================================
+  AgentTestFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Role for the agent test Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: invoke-agent
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !GetAtt AgentRuntime.AgentRuntimeArn
+                  - !Sub "${AgentRuntime.AgentRuntimeArn}/runtime-endpoint/*"
+              - Sid: DecryptEnvVars
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  AgentTestFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the agent test Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-agent-test"
+      RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  AgentTestFn:
+    Type: AWS::Lambda::Function
+    DependsOn: AgentTestFnLogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Invokes the agent to test it end to end"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      FunctionName: !Sub "${ProjectName}-agent-test"
+      Description: Invokes the AgentCore Runtime agent with test prompts and checks the answers
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 600
+      MemorySize: 256
+      Role: !GetAtt AgentTestFnRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+      VpcConfig: !If
+        - TestFnInVpc
+        - SubnetIds: !Ref PrivateSubnetIds
+          SecurityGroupIds: [!Ref WorkloadSecurityGroup]
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !GetAtt AgentRuntime.AgentRuntimeArn
+          QUALIFIER: DEFAULT
+      Code:
+        ZipFile: |
+          import json, os, time, uuid, urllib.parse, urllib.request
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from botocore.config import Config
+          from botocore.exceptions import UnknownServiceError
+
+          ARN = os.environ["AGENT_RUNTIME_ARN"]
+          QUALIFIER = os.environ.get("QUALIFIER", "DEFAULT")
+          REGION = os.environ["AWS_REGION"]
+          session = boto3.Session()
+
+          # Use the SDK client when the Lambda runtime's boto3 includes bedrock-agentcore;
+          # otherwise fall back to a SigV4-signed HTTPS call (same API, any boto3 version).
+          try:
+              client = session.client("bedrock-agentcore", config=Config(
+                  connect_timeout=10, read_timeout=280, retries={"max_attempts": 1}))
+          except UnknownServiceError:
+              client = None
+              print("boto3 has no bedrock-agentcore client - using signed HTTPS requests")
+
+          def _invoke_raw(session_id, payload):
+              url = (f"https://bedrock-agentcore.{REGION}.amazonaws.com/runtimes/"
+                     f"{urllib.parse.quote(ARN, safe='')}/invocations?qualifier={QUALIFIER}")
+              headers = {"Content-Type": "application/json", "Accept": "application/json",
+                         "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id}
+              req = AWSRequest(method="POST", url=url, data=payload, headers=headers)
+              SigV4Auth(session.get_credentials().get_frozen_credentials(), "bedrock-agentcore", REGION).add_auth(req)
+              http = urllib.request.Request(url, data=payload, method="POST", headers=dict(req.headers))
+              with urllib.request.urlopen(http, timeout=280) as r:
+                  return r.headers.get("Content-Type", ""), r.read()
+
+          # Built-in suite against the seeded sample data. A check passes when the answer
+          # contains any of the expected strings (case-insensitive). Built per call so the
+          # "create" case always uses a fresh email (a reused one would hit the 409 duplicate check).
+          def suite():
+              return [
+                  {"name": "list with filter", "prompt": "List the active customers in Ontario.",
+                   "expect_any": ["C-1001", "Alice"]},
+                  {"name": "get by id", "prompt": "What accounts does customer C-1002 have and what is the total balance?",
+                   "expect_any": ["61,234", "61234"]},
+                  {"name": "not found", "prompt": "Show me customer C-9999.",
+                   "expect_any": ["not found", "doesn't exist", "does not exist", "no customer", "couldn't find", "could not find"]},
+                  {"name": "create", "prompt": f"Onboard a new retail customer: Test User, test.user.{uuid.uuid4().hex[:6]}@example.com, Ottawa ON.",
+                   "expect_any": ["PENDING_KYC", "pending KYC"]},
+              ]
+
+          def ask(prompt, session_id=None):
+              session_id = session_id or f"agent-test-{uuid.uuid4()}"     # must be >= 33 chars
+              t0 = time.time()
+              payload = json.dumps({"prompt": prompt}).encode()
+              if client:
+                  resp = client.invoke_agent_runtime(agentRuntimeArn=ARN, qualifier=QUALIFIER,
+                                                     runtimeSessionId=session_id, payload=payload)
+                  ctype, body = resp.get("contentType", ""), resp["response"].read()
+              else:
+                  ctype, body = _invoke_raw(session_id, payload)
+              raw = body.decode("utf-8", "replace")
+              text = raw
+              if "text/event-stream" in ctype:
+                  text = "".join(l[5:].strip() for l in raw.splitlines() if l.startswith("data:"))
+              try:
+                  text = json.loads(text).get("result", text)
+              except (ValueError, AttributeError):
+                  pass
+              return {"answer": text, "seconds": round(time.time() - t0, 1), "sessionId": session_id}
+
+          def handler(event, context):
+              event = event or {}
+              if event.get("prompt"):
+                  cases = [{"name": "custom", "prompt": event["prompt"]}]
+              elif event.get("prompts"):
+                  cases = [{"name": f"custom-{i + 1}", "prompt": p} for i, p in enumerate(event["prompts"])]
+              else:
+                  cases = suite()
+              results = []
+              for c in cases:
+                  if context.get_remaining_time_in_millis() < 60_000:
+                      results.append({"name": c["name"], "status": "SKIPPED", "reason": "out of time"})
+                      continue
+                  try:
+                      r = ask(c["prompt"], event.get("sessionId"))
+                      exp = c.get("expect_any")
+                      ok = None if exp is None else any(e.lower() in str(r["answer"]).lower() for e in exp)
+                      status = "ANSWERED" if ok is None else ("PASS" if ok else "FAIL")
+                      results.append({"name": c["name"], "status": status, "prompt": c["prompt"], **r})
+                  except Exception as e:
+                      results.append({"name": c["name"], "status": "ERROR", "prompt": c["prompt"],
+                                      "error": f"{type(e).__name__}: {e}"})
+                  print(json.dumps(results[-1])[:4000])
+              summary = {s: sum(1 for r in results if r["status"] == s)
+                         for s in ("PASS", "FAIL", "ERROR", "ANSWERED", "SKIPPED") if any(r["status"] == s for r in results)}
+              return {"agentRuntimeArn": ARN, "summary": summary, "results": results}
 
 Outputs:
   AgentRuntimeArn:
@@ -1322,6 +1627,9 @@ Outputs:
     Value: !Ref CognitoM2MClient
   ToolFunctionName:
     Value: !Ref ToolFn
+  AgentTestFunctionName:
+    Description: Invoke with {} for the test suite, or {"prompt":"..."} for one question
+    Value: !Ref AgentTestFn
   KmsKeyArn:
     Description: Customer managed key used by this stack
     Value: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]

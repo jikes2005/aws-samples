@@ -3,7 +3,7 @@
 # token comes from the cognito-idp VPC endpoint. Needs AWS CLI v2 recent enough to
 # have `cognito-idp get-client-token` and IAM permission for DescribeUserPoolClient.
 set -euo pipefail
-PROJECT="${PROJECT:-agentcore-mcp-poc}"
+PROJECT="${PROJECT:-agentcore-poc}"
 REGION="${AWS_REGION:-us-east-1}"
 
 out() { aws cloudformation describe-stacks --region "$REGION" --stack-name "$PROJECT" \

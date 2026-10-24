@@ -10,7 +10,7 @@ import uuid
 
 import boto3
 
-STACK = os.environ.get("PROJECT", "agentcore-mcp-poc")
+STACK = os.environ.get("PROJECT", "agentcore-poc")
 REGION = boto3.Session().region_name or "us-east-1"
 
 cfn = boto3.client("cloudformation", region_name=REGION)

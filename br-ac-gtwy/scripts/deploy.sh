@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Deploys the AgentCore MCP POC (one CloudFormation stack) into an EXISTING
+# Deploys the AgentCore POC (one CloudFormation stack) into an EXISTING
 # VPC / subnets / VPC endpoints. The only step outside CloudFormation is
 # packaging the agent code and uploading it to S3.
 #
 # Usage: export the variables below, then ./scripts/deploy.sh
 set -euo pipefail
 
-PROJECT="${PROJECT:-agentcore-mcp-poc}"
+PROJECT="${PROJECT:-agentcore-poc}"
 REGION="${AWS_REGION:-us-east-1}"
 VPC_ID="${VPC_ID:?set VPC_ID}"
 SUBNET_IDS="${SUBNET_IDS:?set SUBNET_IDS, comma-separated private subnets}"
@@ -20,6 +20,7 @@ SUPPORT_TEAM="${SUPPORT_TEAM:-CLOUD}"
 SERVICE_NAME="${SERVICE_NAME:-AgentCore POC}"
 ENVIRONMENT="${ENVIRONMENT:-dev}"
 KMS_KEY_ARN="${KMS_KEY_ARN:-}"           # blank = stack creates its own CMK
+TEST_FN_IN_VPC="${TEST_FN_IN_VPC:-true}"   # false if the VPC has no bedrock-agentcore data-plane endpoint
 CREATE_APIGW_ACCOUNT_ROLE="${CREATE_APIGW_ACCOUNT_ROLE:-false}"  # true only if the account has no API GW CloudWatch role
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,18 +41,18 @@ echo "==> 1/3 package agent for linux/arm64 (AgentCore Runtime)"
 rm -rf "$BUILD" && mkdir -p "$BUILD/pkg"
 pip install -q -r "$ROOT/agent/requirements.txt" --target "$BUILD/pkg" \
   --platform manylinux2014_aarch64 --python-version 3.12 --implementation cp --only-binary=:all:
-cp "$ROOT/agent/main.py" "$BUILD/pkg/"
+cp "$ROOT/agent/customer_agent.py" "$BUILD/pkg/"
 (cd "$BUILD/pkg" && zip -qr "$BUILD/agent.zip" .)
 aws s3 cp --region "$REGION" "$BUILD/agent.zip" "s3://$ARTIFACT_BUCKET/$CODE_KEY"
 
 echo "==> 2/3 deploy stack $STACK"
 aws cloudformation deploy --region "$REGION" \
-  --stack-name "$STACK" --template-file "$ROOT/cfn/agentcore-mcp-poc.yaml" \
+  --stack-name "$STACK" --template-file "$ROOT/cfn/agentcore-poc.yaml" \
   --parameter-overrides ProjectName="$PROJECT" StageName="$STAGE" \
     VpcId="$VPC_ID" PrivateSubnetIds="$SUBNET_IDS" ExecuteApiVpceId="$EXECUTE_API_VPCE" \
     AppCatID="$APP_CAT_ID" SupportTeam="$SUPPORT_TEAM" ServiceName="$SERVICE_NAME" Environment="$ENVIRONMENT" \
     ExistingKmsKeyArn="$KMS_KEY_ARN" \
-    CreateApiGatewayAccountRole="$CREATE_APIGW_ACCOUNT_ROLE" \
+    CreateApiGatewayAccountRole="$CREATE_APIGW_ACCOUNT_ROLE" TestFunctionInVpc="$TEST_FN_IN_VPC" \
     ArtifactBucket="$ARTIFACT_BUCKET" AgentCodeKey="$CODE_KEY" ModelId="$MODEL_ID" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
 

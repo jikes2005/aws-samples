@@ -1,8 +1,8 @@
-# AgentCore MCP POC
+# AgentCore POC
 
 Strands agent on **Bedrock AgentCore Runtime** → **AgentCore Gateway** (MCP) → **Lambda** tool → **private API Gateway** (Cognito-protected) → Lambda → **DynamoDB**.
 
-Everything is in **one CloudFormation template** (`cfn/agentcore-mcp-poc.yaml`) and runs in an existing VPC using existing subnets and VPC endpoints. Nothing is internet-facing.
+Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and runs in an existing VPC using existing subnets and VPC endpoints. Nothing is internet-facing.
 
 ```
  invoke_agent_runtime
@@ -23,7 +23,7 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-mcp-poc.yaml`) 
 │                              ▼                                                      │
 │              Lambda: customer-api ──► DynamoDB  <project>-customers                 │
 │                                                                                     │
-│  Deploy time only: Lambda: deploy-helper (custom resources)                         │
+│  (Deploy time only, OUTSIDE the VPC: Lambda deploy-helper - custom resources)      │
 │     Custom::CognitoM2MClient → creates the M2M app client                           │
 │     Custom::SeedCustomers    → loads 4 sample customers                             │
 └────────────────────────────────────────────────────────────────────────────────────┘
@@ -33,12 +33,13 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-mcp-poc.yaml`) 
 
 | Path | What it is |
 |---|---|
-| `cfn/agentcore-mcp-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB (PITR + on-demand backup), Cognito (pool, resource server, custom-resource app client), seed custom resource, private REST API + Cognito authorizer, API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
-| `agent/main.py` | Strands agent; loads tools from the gateway over MCP with SigV4 auth |
+| `cfn/agentcore-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB (PITR + on-demand backup), Cognito (pool, resource server, custom-resource app client), seed custom resource, private REST API + Cognito authorizer, API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
+| `agent/customer_agent.py` | Strands agent; loads tools from the gateway over MCP with SigV4 auth |
 | `agent/requirements.txt` | Agent dependencies, pinned to tested major versions (`mcp` stays on 1.x) |
 | `agent/build_agent.ipynb` | Builds the arm64 agent zip in SageMaker AI, uploads it to S3, optionally updates the stack and tests the agent |
 | `scripts/deploy.sh` | Packages the agent for linux/arm64, uploads it to S3, deploys the stack, redeploys the API stage |
-| `scripts/invoke.py` | Calls the runtime with a prompt |
+| `scripts/invoke.py` | Calls the runtime with a prompt from your laptop |
+| `scripts/test-agent.sh` | Invokes the agent test Lambda and prints the results |
 | `scripts/test-api.sh` | Gets a Cognito token and curls the API (run from inside the VPC) |
 
 ## Prerequisites — what must already exist
@@ -50,9 +51,9 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-mcp-poc.yaml`) 
 | `com.amazonaws.<region>.execute-api` | Tool Lambda → private API (its ID is a stack parameter) |
 | `com.amazonaws.<region>.cognito-idp` | Tool Lambda (token), deploy helper (app client) |
 | `com.amazonaws.<region>.dynamodb` (gateway endpoint on the subnets' route tables) | API Lambda, deploy helper (seed) |
-| `com.amazonaws.<region>.s3` (gateway endpoint on the subnets' route tables) | Deploy helper → sends its result to CloudFormation's pre-signed S3 URL. **Required** (the helper always runs in the VPC) |
 | `com.amazonaws.<region>.bedrock-runtime` | Agent → model |
 | `com.amazonaws.<region>.bedrock-agentcore.gateway` | Agent → MCP gateway |
+| `com.amazonaws.<region>.bedrock-agentcore` (data plane) | Agent test Lambda → `InvokeAgentRuntime`. Only needed while `TestFunctionInVpc=true` (the default) |
 | `com.amazonaws.<region>.logs` | Agent runtime logging |
 
 Also needed:
@@ -77,10 +78,11 @@ export ARTIFACT_BUCKET=my-artifacts-bucket
 # export ENVIRONMENT=dev
 # export KMS_KEY_ARN=arn:aws:kms:...:key/...   # use an existing CMK (blank = stack creates one)
 # export CREATE_APIGW_ACCOUNT_ROLE=true        # only if the account has no API Gateway CloudWatch role
+# export TEST_FN_IN_VPC=false                  # only if the VPC has no bedrock-agentcore data-plane endpoint
 ./scripts/deploy.sh
 ```
 
-The stack name is `agentcore-mcp-poc` (override with `PROJECT`). Re-running uploads a new agent zip under a new key, which updates the runtime, and redeploys the API stage.
+The stack name is `agentcore-poc` (override with `PROJECT`). Re-running uploads a new agent zip under a new key, which updates the runtime, and redeploys the API stage.
 
 You can also deploy the template from the console or a pipeline. Upload the agent zip first and pass its key as `AgentCodeKey`.
 
@@ -90,8 +92,8 @@ Upload the `agent/` folder to a SageMaker AI notebook instance or Studio Jupyter
 
 1. **Configure:** set `PROJECT` and `ARTIFACT_BUCKET` (blank uses the SageMaker default bucket).
 2. **Install:** installs dependencies for linux/arm64, Python 3.12, using arm64 wheels only. The SageMaker instance is usually x86_64, so nothing is compiled locally.
-3. **Check:** syntax-checks `main.py`, then confirms every native extension is an aarch64 build and `mcp` is 1.x.
-4. **Zip and upload:** writes `agent.zip` with `main.py` at the root and uploads it under a new versioned key. It prints the key to use as `AgentCodeKey`.
+3. **Check:** syntax-checks `customer_agent.py`, then confirms every native extension is an aarch64 build and `mcp` is 1.x.
+4. **Zip and upload:** writes `agent.zip` with `customer_agent.py` at the root and uploads it under a new versioned key. It prints the key to use as `AgentCodeKey`.
 5. **Update stack** (`DEPLOY_STACK = True`): updates the existing stack, changing only `ArtifactBucket` and `AgentCodeKey`. Every other parameter keeps its previous value.
 6. **Test** (`RUN_TEST = True`): invokes the agent. You can also call `ask("...")` from any cell.
 
@@ -101,7 +103,52 @@ The notebook's execution role needs `s3:PutObject` on the bucket. Steps 5–6 al
 
 ## Test
 
-**Agent end to end** (from your laptop):
+### Agent test Lambda (recommended)
+
+The stack deploys `<project>-agent-test`, a Lambda that calls the agent through `InvokeAgentRuntime`, the same way a real client would, and checks the answers.
+
+```bash
+./scripts/test-agent.sh                              # built-in suite
+./scripts/test-agent.sh "Show me customer C-1003"    # one question
+```
+
+The script prints each question and answer with PASS/FAIL, and exits non-zero on any FAIL or ERROR, so you can use it in a pipeline.
+
+**Invoking it directly** from the Lambda console Test tab or the CLI:
+
+| Event | What it does |
+|---|---|
+| `{}` | Runs the built-in suite (4 checks against the seed data) |
+| `{"prompt": "..."}` | Asks one question; status `ANSWERED` |
+| `{"prompts": ["...", "..."]}` | Asks several questions |
+| add `"sessionId": "<33+ chars>"` | Reuses one runtime session for every prompt |
+
+```bash
+aws lambda invoke --function-name agentcore-poc-agent-test \
+  --cli-binary-format raw-in-base64-out --cli-read-timeout 620 \
+  --payload '{"prompt":"List active customers in Ontario"}' out.json && cat out.json
+```
+
+**The built-in suite:**
+
+| Check | Prompt | Passes if the answer contains |
+|---|---|---|
+| list with filter | active customers in Ontario | `C-1001` or `Alice` |
+| get by id | C-1002's accounts and total balance | `61,234` |
+| not found | customer C-9999 | "not found", "couldn't find", … |
+| create | onboard a new customer (unique email per run) | `PENDING_KYC` |
+
+The answers come from an LLM, so the checks look for key facts rather than exact wording. The **create** check writes a real `Test User` record to the table on every run.
+
+**Details:**
+- **Timeouts:** each question can take up to 280 seconds, and the Lambda itself up to 10 minutes. Questions that don't fit in the remaining time are reported as `SKIPPED`.
+- **No boto3 dependency:** it uses the boto3 `bedrock-agentcore` client when the Lambda runtime includes it. Otherwise it sends the same request signed with SigV4, so it doesn't depend on the runtime's boto3 version.
+- **Network:** with `TestFunctionInVpc=true` (the default) it runs in the VPC and needs the `bedrock-agentcore` data-plane endpoint. With `false` it runs outside the VPC, which the org hook reports as a warning.
+- **Permissions:** its role can only call `bedrock-agentcore:InvokeAgentRuntime` on this runtime.
+
+### From your laptop
+
+**Agent end to end:**
 
 ```bash
 python scripts/invoke.py "List active customers in Ontario"
@@ -116,12 +163,23 @@ New customers persist in DynamoDB, so a follow-up "show me Dana Lee's record" wo
 
 ```bash
 CTX=$(printf '{"custom":{"bedrockAgentCoreToolName":"customer-tools___get_customer"}}' | base64 -w0)
-aws lambda invoke --function-name agentcore-mcp-poc-customer-tools \
+aws lambda invoke --function-name agentcore-poc-customer-tools \
   --client-context "$CTX" --cli-binary-format raw-in-base64-out \
   --payload file://events/tool-get-customer.json out.json && cat out.json
 ```
 
 **API directly** (from an instance in the VPC): `./scripts/test-api.sh` checks that a request without a token gets 401, then runs the GETs and a POST.
+
+## Why the deploy helper runs outside the VPC
+
+Every Lambda that serves traffic (API backend, MCP tool) runs in the VPC. The one exception is `deploy-helper`, which only runs while CloudFormation creates, updates or deletes the stack. This is the same pattern as the RAG POC's schema-init Lambda.
+
+- **Why it can't run in the VPC:** after each custom-resource action it must `PUT` its result to a pre-signed URL in an AWS-owned S3 bucket (`cloudformation-custom-resource-response-<region>`). The private subnets can't resolve that hostname. In the VPC this failed with `URLError: [Errno 16] Device or resource busy`, Lambda's form of a DNS failure. CloudFormation then waited and rolled back.
+- **What it calls:** only AWS APIs (Cognito app-client management, DynamoDB `PutItem` and `CreateBackup`) and the response URL. Nothing in the VPC.
+- **How it answers CloudFormation:** it retries the response up to 5 times. A timer also sends `FAILED` 20 seconds before the Lambda times out, so a hung call can't leave the stack waiting.
+- **Effect on the org hook:** it flags this as a **warning** (Lam.23), not an error, so it doesn't block the deploy. Checkov reports the same as CKV_AWS_117.
+
+To move it into the VPC later, the subnets need DNS resolution and a route to `*.s3.<region>.amazonaws.com`, and an S3 endpoint policy that allows `s3:PutObject` on the response bucket. Then add `VpcConfig` back to `DeployHelperFn` and `AWSLambdaVPCAccessExecutionRole` to its role.
 
 ## Cognito custom resource
 
@@ -137,7 +195,7 @@ aws lambda invoke --function-name agentcore-mcp-poc-customer-tools \
 
 When CloudFormation adds the flow, replace the custom resource with a native `AWS::Cognito::UserPoolClient`.
 
-**If a custom resource can't reach CloudFormation** (no S3 route from the subnets), the stack waits up to `ServiceTimeout` (5 minutes) and then fails. Fix the S3 gateway endpoint (route on the private subnets' route tables, and an endpoint policy that allows the CloudFormation response bucket).
+**If a custom resource can't reach CloudFormation**, the helper logs each failed send. If all 5 fail, the stack waits up to `ServiceTimeout` (5 minutes) and then fails.
 
 ## Organisation policy hook (CCF::PAC::LambdaHook)
 
@@ -146,8 +204,8 @@ The account runs a CloudFormation hook that scans **the template itself**, befor
 | Hook finding | Fix in the template |
 |---|---|
 | API.31 – stage tagged `ApplyCommonWaf` | Literal `"true"` tag on `ApiStage` |
-| DDB.14 – deletion protection | `DeletionProtectionEnabled: true` on the table |
-| Lam.23 – Lambda in a VPC | The deploy helper always runs in the VPC (the earlier opt-out was removed) |
+| DDB.14 – deletion protection | `DeletionProtectionEnabled: true` on the table. `TableDeletionGuard` lifts it only when the stack is deleted |
+| Lam.23 – Lambda in a VPC (warning) | The API and tool Lambdas run in the VPC. `deploy-helper` intentionally doesn't (see *Why the deploy helper runs outside the VPC*), so this stays a non-blocking warning for that one function |
 | Required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (24). `Description` is per resource. The others come from parameters |
 | DDB.11 – on-demand backup | Literal tag `dynamodbbackup: "True"` on the table. The hook checks the tag, which enrols the table in the organisation's backup policy (confirm with your platform team) |
 
@@ -163,7 +221,15 @@ Resources that can't take tags are skipped: custom resources, API methods and re
 | X-Ray tracing on the API stage | `TracingEnabled: true` | CKV_AWS_73 |
 | API Gateway access logging | JSON access logs to a CMK-encrypted log group, 90-day retention | CKV_AWS_76 |
 
-Checkov 3.x result for the template: **82 passed, 7 failed**. None of the failures are in the list above. They are Lambda dead-letter queues and reserved concurrency (CKV_AWS_116/115) and API caching (CKV_AWS_120). Dead-letter queues only apply to async invocations, and these Lambdas are called synchronously.
+Checkov 3.x result for the template: **97 passed, 10 failed**. None of the failures are in the list above. They are:
+
+- Lambda dead-letter queues and reserved concurrency (CKV_AWS_116/115)
+- API caching (CKV_AWS_120)
+- `deploy-helper` not in a VPC (CKV_AWS_117, intentional)
+
+The DLQ and concurrency findings now count 4 Lambdas, including the agent test Lambda.
+
+ Dead-letter queues only apply to async invocations, and these Lambdas are called synchronously.
 
 **About "API Gateway V2" access logging:** this stack has no API Gateway V2 (HTTP/WebSocket) API. The customer API is a REST API (v1), because only REST APIs support the `PRIVATE` endpoint type. Access logging is enabled on that REST stage, which satisfies the v1 rule (CKV_AWS_76). The V2 rule (CKV_AWS_95) only applies to `AWS::ApiGatewayV2::Stage`, so it has nothing to evaluate here.
 
@@ -208,7 +274,7 @@ DynamoDB's own backups don't need AWS Backup or a vault.
 - **Scheduled:** handled by your organisation's AWS Backup policy, via the `dynamodbbackup: "True"` tag. Those recovery points live in the org's vault, not in this stack.
 - **Continuous:** PITR lets you restore to any second in the last 35 days.
 - **On demand:** to take another native on-demand backup, bump `BackupVersion` on the `OnDemandBackup` resource and redeploy, or run `aws dynamodb create-backup` at any time.
-- **Retention:** native on-demand backups don't expire; delete them when they're no longer needed.
+- **Retention:** the stack's on-demand backup is deleted with the stack. When you bump `BackupVersion`, the previous one is deleted. Backups you take by hand are yours to delete.
 
 ## Design notes
 
@@ -221,25 +287,33 @@ DynamoDB's own backups don't need AWS Backup or a vault.
 - **DynamoDB:** on-demand, PITR and encryption on.
   - `list_customers` uses a Scan with filters, which is fine at POC size. Add GSIs for real access patterns.
   - POST rejects duplicate emails via the `email-index` GSI and uses a conditional put on `customerId`.
-  - The table has `DeletionPolicy: Delete`; switch to `Retain` before putting real data in it.
+  - The table is deleted with the stack (see *Cleanup*). For real data, switch to `DeletionPolicy: Retain` and remove `TableDeletionGuard`.
 - **Tool input is whitelisted.** The tool Lambda forwards only known fields to POST.
 - `ExceptionLevel: DEBUG` on the gateway returns detailed tool errors to the agent. Useful for a POC; remove it later.
 
 ## Cleanup
 
 ```bash
-# Deletion protection is on - turn it off first or the delete fails
-aws dynamodb update-table --table-name agentcore-mcp-poc-customers --no-deletion-protection-enabled
-aws cloudformation delete-stack --stack-name agentcore-mcp-poc
-aws cloudformation wait stack-delete-complete --stack-name agentcore-mcp-poc
+aws cloudformation delete-stack --stack-name agentcore-poc
+aws cloudformation wait stack-delete-complete --stack-name agentcore-poc
 ```
 
-The custom resource deletes the app client before the user pool goes. Lambda VPC ENIs can take several minutes to release. Your VPC, subnets, endpoints and the agent zip in S3 are untouched.
+Deleting the stack removes everything it created. No resources have `DeletionPolicy: Retain`. A few things CloudFormation can't remove by itself are handled by the deploy helper during the delete:
 
-**Retained on purpose**, so backups stay usable after the stack is gone:
+| Item | How it's removed |
+|---|---|
+| DynamoDB table (deletion protection on) | `TableDeletionGuard` is deleted first. It turns deletion protection off and waits for the table to be `ACTIVE`, then CloudFormation deletes the table |
+| On-demand backup | `OnDemandBackup` deletes its backup |
+| AgentCore Runtime log group (`/aws/bedrock-agentcore/runtimes/<name>-*`, created by the service) | `RuntimeLogCleanup` deletes it after the runtime is gone. The runtime takes its name from this resource, so CloudFormation deletes the runtime first |
+| Cognito app client | `CognitoM2MClient` deletes it before the user pool goes |
+| Lambda, API access and helper log groups | Owned by the stack, deleted normally |
+| KMS key and alias | Deleted with the stack. KMS doesn't delete keys immediately: the key enters **Pending deletion for 7 days** (the minimum) and is then destroyed. To recover it in that window, run `aws kms cancel-key-deletion` |
 
-- **The KMS key and its alias:** schedule deletion with `aws kms schedule-key-deletion` when you're done.
-- **Native DynamoDB on-demand backups:** `aws dynamodb list-backups`, then `delete-backup`.
-- **The account-level API Gateway CloudWatch role setting,** if the stack created it.
+Deletion takes a few minutes, mostly waiting for Lambda VPC network interfaces to be released.
 
-Delete the backups before the key, or they become unreadable.
+**Not removed**, because the stack doesn't own them:
+
+- **Your VPC, subnets, VPC endpoints and the artifact S3 bucket.** The agent zips that `deploy.sh` uploaded under `agentcore-poc/` stay in the bucket. Delete them with `aws s3 rm s3://<bucket>/agentcore-poc/ --recursive`.
+- **Recovery points made by your organisation's backup policy** (from the `dynamodbbackup` tag). Those live in the org's vault under its retention rules.
+- **The account-level API Gateway CloudWatch setting:** if you deployed with `CREATE_APIGW_ACCOUNT_ROLE=true`, deleting the stack deletes that role. The account setting keeps pointing at it, so other APIs' logging in that account and region stops until it's set again.
+- **Test customers** written by the agent test Lambda go away with the table.
