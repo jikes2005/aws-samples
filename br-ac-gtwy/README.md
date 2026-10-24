@@ -33,7 +33,7 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-mcp-poc.yaml`) 
 
 | Path | What it is |
 |---|---|
-| `cfn/agentcore-mcp-poc.yaml` | The whole POC: workload SG, DynamoDB, Cognito (pool, resource server, custom-resource app client), seed custom resource, private REST API + Cognito authorizer, API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
+| `cfn/agentcore-mcp-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB + AWS Backup, Cognito (pool, resource server, custom-resource app client), seed custom resource, private REST API + Cognito authorizer, API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Runtime |
 | `agent/main.py` | Strands agent; loads tools from the gateway over MCP with SigV4 auth |
 | `agent/requirements.txt` | Agent dependencies, pinned to tested major versions (`mcp` stays on 1.x) |
 | `agent/build_agent.ipynb` | Builds the arm64 agent zip in SageMaker AI, uploads it to S3, optionally updates the stack and tests the agent |
@@ -71,6 +71,10 @@ export SUBNET_IDS=subnet-aaaa,subnet-bbbb
 export EXECUTE_API_VPCE=vpce-xxxxxxxx
 export ARTIFACT_BUCKET=my-artifacts-bucket
 # export HELPER_IN_VPC=false   # only if the VPC has no S3 gateway endpoint
+# export KMS_KEY_ARN=arn:aws:kms:...:key/...   # use an existing CMK (blank = stack creates one)
+# export APPLY_COMMON_WAF=false                # ApplyCommonWaf stage tag (default true)
+# export BACKUP_RETENTION_DAYS=35
+# export CREATE_APIGW_ACCOUNT_ROLE=true        # only if the account has no API Gateway CloudWatch role
 ./scripts/deploy.sh
 ```
 
@@ -133,6 +137,58 @@ When CloudFormation adds the flow, replace the custom resource with a native `AW
 
 **If a custom resource can't reach CloudFormation** (no S3 route from the subnets), the stack waits up to `ServiceTimeout` (5 minutes) and then fails. Fix the S3 gateway endpoint, or set `HelperFunctionsInVpc=false`.
 
+## Security controls
+
+| Requirement | How it's met | Scanner check (Checkov) |
+|---|---|---|
+| Customer managed KMS key everywhere it's supported | One CMK (rotation on), or bring your own via `ExistingKmsKeyArn`. See coverage below | CKV_AWS_119, 158, 166, 173, 7 |
+| DynamoDB encrypted with the CMK | `SSEType: KMS` + `KMSMasterKeyId` | CKV_AWS_119 |
+| On-demand backup configured | AWS Backup daily plan into a CMK-encrypted vault (`BackupRetentionDays`, default 35), **plus** a native DynamoDB on-demand backup taken at deploy (`Custom::DynamoDbOnDemandBackup`). PITR stays on | CKV_AWS_166, CKV_AWS_28 |
+| API stage tagged `ApplyCommonWaf` | Stage tag from the `ApplyCommonWaf` parameter (`true`/`false`, default `true`) | — |
+| X-Ray tracing on the API stage | `TracingEnabled: true` | CKV_AWS_73 |
+| API Gateway access logging | JSON access logs to a CMK-encrypted log group, 90-day retention | CKV_AWS_76 |
+
+Checkov 3.x result for the template: **90 passed, 7 failed**. None of the failures are in the list above. They are Lambda dead-letter queues and reserved concurrency (CKV_AWS_116/115) and API caching (CKV_AWS_120). Dead-letter queues only apply to async invocations, and these Lambdas are called synchronously.
+
+**About "API Gateway V2" access logging:** this stack has no API Gateway V2 (HTTP/WebSocket) API. The customer API is a REST API (v1), because only REST APIs support the `PRIVATE` endpoint type. Access logging is enabled on that REST stage, which satisfies the v1 rule (CKV_AWS_76). The V2 rule (CKV_AWS_95) only applies to `AWS::ApiGatewayV2::Stage`, so it has nothing to evaluate here.
+
+### CMK coverage
+
+| Resource | Encryption |
+|---|---|
+| DynamoDB table | CMK |
+| AWS Backup vault (scheduled recovery points) | CMK |
+| DynamoDB on-demand backups | CMK (inherits the table's key) |
+| CloudWatch log groups (3 Lambdas + API access logs) | CMK |
+| Lambda environment variables (3 functions) | CMK |
+| AgentCore Gateway | CMK |
+| AgentCore Runtime (serverless) | AWS-owned key. No CMK option for the serverless compute type |
+| AgentCore Runtime log group | Created by the service at first run, so it has the default encryption. Add a CMK afterwards with `aws logs associate-kms-key` if needed |
+| Cognito user pool | AWS-owned key. Cognito has no CMK option for user pool data |
+| API Gateway | No data at rest (no cache configured) |
+| Agent zip in S3 | Your existing bucket's encryption settings |
+
+The key policy grants:
+
+- **Account root:** enables IAM policies on the key.
+- **CloudWatch Logs:** scoped to this account's log groups.
+- **Gateway service role:** scoped to `bedrock-agentcore` and an encryption context of this account's gateway ARNs.
+- **AWS Backup role:** via the `backup` and `dynamodb` services.
+
+The two roles that access the table get key use through `dynamodb.<region>.amazonaws.com` only, granted in IAM. There's no wildcard principal. None of these calls go from the VPC to KMS, so you don't need a KMS endpoint.
+
+**Using an existing CMK (`ExistingKmsKeyArn`):** the stack can't edit that key's policy. Add the CloudWatch Logs, AgentCore Gateway and AWS Backup statements from the `KmsKey` resource yourself, using this stack's `GatewayRole` and `BackupRole` ARNs.
+
+### Access-logging prerequisite
+
+API Gateway access logging needs a CloudWatch Logs role set at the **account level** for each region. `deploy.sh` checks this first and stops if none is set. If your account doesn't have one, set `CREATE_APIGW_ACCOUNT_ROLE=true` and the stack creates it. That overwrites the account-wide setting, so in a shared account check with your platform team first.
+
+### Backups
+
+- **Scheduled:** the AWS Backup plan runs daily at 06:00 UTC.
+- **On demand:** to take another native on-demand backup, bump `BackupVersion` on the `OnDemandBackup` resource and redeploy. Or run `aws dynamodb create-backup` or `aws backup start-backup-job` at any time.
+- **Retention:** native on-demand backups don't expire; delete them when they're no longer needed.
+
 ## Design notes
 
 - **Cognito without a domain.** A user pool with a domain can't be reached through the cognito-idp VPC endpoint, and `/oauth2/token` isn't available over PrivateLink. So the pool has no domain, and the tool Lambda uses Cognito's `GetClientToken` API (client-credentials M2M), which goes through the cognito-idp endpoint.
@@ -156,3 +212,12 @@ aws cloudformation wait stack-delete-complete --stack-name agentcore-mcp-poc
 ```
 
 The custom resource deletes the app client before the user pool goes. Lambda VPC ENIs can take several minutes to release. Your VPC, subnets, endpoints and the agent zip in S3 are untouched.
+
+**Retained on purpose**, so backups stay usable after the stack is gone:
+
+- **The KMS key and its alias:** schedule deletion with `aws kms schedule-key-deletion` when you're done.
+- **The backup vault:** delete its recovery points first, then the vault.
+- **Native DynamoDB on-demand backups:** `aws dynamodb list-backups`, then `delete-backup`.
+- **The account-level API Gateway CloudWatch role setting,** if the stack created it.
+
+Delete the backups before the key, or they become unreadable.

@@ -3,7 +3,9 @@ Description: >
   AgentCore MCP POC (single stack). Uses an EXISTING VPC, subnets and VPC endpoints.
   Strands agent on AgentCore Runtime -> AgentCore Gateway (MCP) -> tool Lambda ->
   private API Gateway (Cognito M2M authorizer) -> Lambda -> DynamoDB.
-  Custom resources create the Cognito app client (ALLOW_CLIENT_TOKEN_AUTH) and seed sample data.
+  Custom resources create the Cognito app client (ALLOW_CLIENT_TOKEN_AUTH), seed sample data
+  and take an on-demand DynamoDB backup. A customer managed KMS key encrypts every resource
+  that supports one.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -12,6 +14,8 @@ Metadata:
         Parameters: [VpcId, PrivateSubnetIds, ExecuteApiVpceId, HelperFunctionsInVpc]
       - Label: { default: Agent }
         Parameters: [ArtifactBucket, AgentCodeKey, ModelId]
+      - Label: { default: "Encryption, backup and API controls" }
+        Parameters: [ExistingKmsKeyArn, BackupRetentionDays, ApplyCommonWaf, CreateApiGatewayAccountRole]
       - Label: { default: General }
         Parameters: [ProjectName, StageName]
 
@@ -50,11 +54,121 @@ Parameters:
     Type: String
     Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
     Description: Bedrock model or inference-profile ID enabled in this account/region
+  ExistingKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]{36}$"
+    Description: >
+      Leave blank to create a customer managed key for this stack. To use an existing CMK,
+      give its key ARN (not an alias) and add the key policy statements from the README.
+  BackupRetentionDays:
+    Type: Number
+    Default: 35
+    MinValue: 1
+    MaxValue: 3650
+    Description: Retention for the daily AWS Backup recovery points
+  ApplyCommonWaf:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Value of the ApplyCommonWaf tag on the API stage
+  CreateApiGatewayAccountRole:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >
+      API Gateway access logging needs a CloudWatch Logs role in the account-level API Gateway
+      settings (one per account and region). Set true ONLY if the account has none - this
+      overwrites the existing account setting.
 
 Conditions:
   HelperInVpc: !Equals [!Ref HelperFunctionsInVpc, "true"]
+  CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
+  CreateApiGwAccount: !Equals [!Ref CreateApiGatewayAccountRole, "true"]
 
 Resources:
+  # =====================================================================
+  # Customer managed KMS key - used by DynamoDB, AWS Backup, CloudWatch log
+  # groups (incl. API access logs), Lambda environment variables and the
+  # AgentCore Gateway. Skipped when ExistingKmsKeyArn is set.
+  # =====================================================================
+  KmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateKmsKey
+    DeletionPolicy: Retain             # keep the key so retained backups stay readable
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${ProjectName} - CMK for data at rest"
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+          - Sid: AgentCoreGatewayDescribeKey
+            Effect: Allow
+            Principal: { AWS: !GetAtt GatewayRole.Arn }
+            Action: kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub "bedrock-agentcore.${AWS::Region}.amazonaws.com"
+          - Sid: AgentCoreGatewayUseKey
+            Effect: Allow
+            Principal: { AWS: !GetAtt GatewayRole.Arn }
+            Action: [kms:Decrypt, kms:GenerateDataKey]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub "bedrock-agentcore.${AWS::Region}.amazonaws.com"
+              StringLike:
+                kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+          - Sid: AgentCoreGatewayCreateGrant
+            Effect: Allow
+            Principal: { AWS: !GetAtt GatewayRole.Arn }
+            Action: kms:CreateGrant
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub "bedrock-agentcore.${AWS::Region}.amazonaws.com"
+                kms:GrantConstraintType: EncryptionContextSubset
+              ForAllValues:StringEquals:
+                kms:GrantOperations: [Decrypt, GenerateDataKey]
+              StringLike:
+                kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+          - Sid: AwsBackup
+            Effect: Allow
+            Principal: { AWS: !GetAtt BackupRole.Arn }
+            Action: [kms:Decrypt, kms:GenerateDataKey*, kms:ReEncrypt*, kms:DescribeKey, kms:CreateGrant]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService:
+                  - !Sub "backup.${AWS::Region}.amazonaws.com"
+                  - !Sub "dynamodb.${AWS::Region}.amazonaws.com"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateKmsKey
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}"
+      TargetKeyId: !Ref KmsKey
+
   # =====================================================================
   # Network (existing VPC) - only the workload security group is created
   # =====================================================================
@@ -98,6 +212,56 @@ Resources:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------- AWS Backup (scheduled backups, CMK-encrypted vault) ----------------
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: Retain             # recovery points outlive the stack
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: !Sub "${ProjectName}-vault"
+      EncryptionKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub "${ProjectName}-daily"
+        BackupPlanRule:
+          - RuleName: daily
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 6 * * ? *)      # 06:00 UTC daily
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle:
+              DeleteAfterDays: !Ref BackupRetentionDays
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: backup.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: customers-table
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources: [!GetAtt CustomersTable.Arn]
 
   # =====================================================================
   # Cognito (machine-to-machine). No user pool domain on purpose: a domain
@@ -151,14 +315,26 @@ Resources:
                   - cognito-idp:DescribeUserPoolClient
                 Resource: !GetAtt UserPool.Arn
               - Effect: Allow
-                Action: dynamodb:PutItem
+                Action: [dynamodb:PutItem, dynamodb:CreateBackup]
                 Resource: !GetAtt CustomersTable.Arn
+              - Sid: UseCmkViaDynamoDb
+                Effect: Allow
+                Action: [kms:Encrypt, kms:Decrypt, kms:ReEncrypt*, kms:GenerateDataKey*, kms:DescribeKey, kms:CreateGrant]
+                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "dynamodb.${AWS::Region}.amazonaws.com"
+              - Sid: DecryptEnvVars
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   DeployHelperLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-deploy-helper"
       RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   DeployHelperFn:
     Type: AWS::Lambda::Function
@@ -172,6 +348,7 @@ Resources:
       Timeout: 120
       MemorySize: 256
       Role: !GetAtt DeployHelperRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
       VpcConfig: !If
         - HelperInVpc
         - SubnetIds: !Ref PrivateSubnetIds
@@ -270,7 +447,23 @@ Resources:
                           raise
               return f"seed-{event['ResourceProperties']['TableName']}", {"Written": str(written)}
 
-          HANDLERS = {"Custom::CognitoM2MClient": cognito_client, "Custom::SeedCustomers": seed}
+          # ---------- Custom::DynamoDbOnDemandBackup ----------
+          def on_demand_backup(event):
+              # Native DynamoDB on-demand backup (encrypted with the table's CMK). Taken on
+              # create and whenever BackupVersion changes. Backups are kept on stack delete.
+              p = event["ResourceProperties"]
+              if event["RequestType"] == "Delete":
+                  return event.get("PhysicalResourceId", "backup"), {}
+              old = event.get("OldResourceProperties", {})
+              if event["RequestType"] == "Update" and old.get("BackupVersion") == p.get("BackupVersion"):
+                  return event["PhysicalResourceId"], {}
+              name = f"{p['TableName']}-ondemand-v{p.get('BackupVersion', '1')}"[:255]
+              b = boto3.client("dynamodb").create_backup(TableName=p["TableName"], BackupName=name)
+              arn = b["BackupDetails"]["BackupArn"]
+              return arn, {"BackupArn": arn}
+
+          HANDLERS = {"Custom::CognitoM2MClient": cognito_client, "Custom::SeedCustomers": seed,
+                      "Custom::DynamoDbOnDemandBackup": on_demand_backup}
 
           def handler(event, context):
               safe = {k: v for k, v in event.items() if k != "ResponseURL"}
@@ -304,6 +497,15 @@ Resources:
       TableName: !Ref CustomersTable
       SeedVersion: "1"                 # bump to re-run (existing IDs are never overwritten)
 
+  OnDemandBackup:
+    Type: Custom::DynamoDbOnDemandBackup
+    DependsOn: SeedCustomers
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      TableName: !Ref CustomersTable
+      BackupVersion: "1"               # bump to take another on-demand backup
+
   # =====================================================================
   # Customer API Lambda (DynamoDB CRUD)
   # =====================================================================
@@ -328,12 +530,24 @@ Resources:
                 Resource:
                   - !GetAtt CustomersTable.Arn
                   - !Sub "${CustomersTable.Arn}/index/*"
+              - Sid: UseCmkViaDynamoDb
+                Effect: Allow
+                Action: [kms:Encrypt, kms:Decrypt, kms:ReEncrypt*, kms:GenerateDataKey*, kms:DescribeKey, kms:CreateGrant]
+                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "dynamodb.${AWS::Region}.amazonaws.com"
+              - Sid: DecryptEnvVars
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   CustomerApiFnLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-api"
       RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   CustomerApiFn:
     Type: AWS::Lambda::Function
@@ -346,6 +560,7 @@ Resources:
       Timeout: 10
       MemorySize: 256
       Role: !GetAtt CustomerApiFnRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [!Ref WorkloadSecurityGroup]
@@ -555,12 +770,65 @@ Resources:
     Properties:
       RestApiId: !Ref CustomerApi
 
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-customer-api/access"
+      RetentionInDays: 90
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  # Account-level setting (one per account/region) required for API Gateway logging.
+  # Only created when CreateApiGatewayAccountRole=true.
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: CreateApiGwAccount
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: CreateApiGwAccount
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
   ApiStage:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref CustomerApi
       DeploymentId: !Ref ApiDeployment
       StageName: !Ref StageName
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","extendedRequestId":"$context.extendedRequestId",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath","path":"$context.path","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength",
+          "responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency",
+          "sourceIp":"$context.identity.sourceIp","vpceId":"$context.identity.vpceId",
+          "clientId":"$context.authorizer.claims.client_id","scope":"$context.authorizer.claims.scope",
+          "xrayTraceId":"$context.xrayTraceId","errorMessage":"$context.error.message",
+          "authorizerError":"$context.authorizer.error"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          DataTraceEnabled: false
+      Tags:
+        - Key: ApplyCommonWaf
+          Value: !Ref ApplyCommonWaf
+        - Key: Project
+          Value: !Ref ProjectName
 
   # =====================================================================
   # MCP tool Lambda (Gateway target) - Cognito M2M token -> private API
@@ -586,12 +854,17 @@ Resources:
               - Effect: Allow
                 Action: cognito-idp:DescribeUserPoolClient
                 Resource: !GetAtt UserPool.Arn
+              - Sid: DecryptEnvVars
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   ToolFnLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-tools"
       RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   ToolFn:
     Type: AWS::Lambda::Function
@@ -604,6 +877,7 @@ Resources:
       Timeout: 15
       MemorySize: 256
       Role: !GetAtt ToolFnRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
         SecurityGroupIds: [!Ref WorkloadSecurityGroup]
@@ -710,9 +984,11 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # ARN built from the function name (not !GetAtt) to avoid a cycle:
+              # KMS key policy -> GatewayRole -> ToolFn -> KMS key
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !GetAtt ToolFn.Arn
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-customer-tools"
 
   McpGateway:
     Type: AWS::BedrockAgentCore::Gateway
@@ -722,6 +998,7 @@ Resources:
       ProtocolType: MCP
       AuthorizerType: AWS_IAM
       RoleArn: !GetAtt GatewayRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
       ExceptionLevel: DEBUG   # POC only - remove for anything beyond a POC
 
   CustomerToolsTarget:
@@ -865,6 +1142,15 @@ Outputs:
     Value: !Ref CognitoM2MClient
   ToolFunctionName:
     Value: !Ref ToolFn
+  KmsKeyArn:
+    Description: Customer managed key used by this stack
+    Value: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+  BackupVaultName:
+    Value: !Ref BackupVault
+  OnDemandBackupArn:
+    Value: !Ref OnDemandBackup
+  ApiAccessLogGroup:
+    Value: !Ref ApiAccessLogGroup
   WorkloadSecurityGroupId:
     Description: Endpoint security groups must allow 443 from this SG (or the VPC CIDR)
     Value: !Ref WorkloadSecurityGroup
