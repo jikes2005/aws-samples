@@ -1,0 +1,870 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentCore MCP POC (single stack). Uses an EXISTING VPC, subnets and VPC endpoints.
+  Strands agent on AgentCore Runtime -> AgentCore Gateway (MCP) -> tool Lambda ->
+  private API Gateway (Cognito M2M authorizer) -> Lambda -> DynamoDB.
+  Custom resources create the Cognito app client (ALLOW_CLIENT_TOKEN_AUTH) and seed sample data.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Existing network }
+        Parameters: [VpcId, PrivateSubnetIds, ExecuteApiVpceId, HelperFunctionsInVpc]
+      - Label: { default: Agent }
+        Parameters: [ArtifactBucket, AgentCodeKey, ModelId]
+      - Label: { default: General }
+        Parameters: [ProjectName, StageName]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentcore-mcp-poc
+    AllowedPattern: "^[a-z][a-z0-9-]{2,29}$"
+  StageName:
+    Type: String
+    Default: dev
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Existing private subnets (2+ AZs) for Lambdas and AgentCore Runtime ENIs
+  ExecuteApiVpceId:
+    Type: String
+    AllowedPattern: "^vpce-[0-9a-f]+$"
+    Description: Existing execute-api interface endpoint ID (private API is pinned to it)
+  HelperFunctionsInVpc:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      Run the deploy-time custom-resource Lambda in the VPC. Needs an S3 gateway endpoint
+      so it can send its result to CloudFormation's pre-signed S3 URL. Set false if the VPC
+      has no S3 route (the helper then uses public AWS endpoints).
+  ArtifactBucket:
+    Type: String
+    Description: Existing S3 bucket holding the agent code zip
+  AgentCodeKey:
+    Type: String
+    Description: S3 key of the agent zip. A new key forces a runtime update.
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: Bedrock model or inference-profile ID enabled in this account/region
+
+Conditions:
+  HelperInVpc: !Equals [!Ref HelperFunctionsInVpc, "true"]
+
+Resources:
+  # =====================================================================
+  # Network (existing VPC) - only the workload security group is created
+  # =====================================================================
+  WorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} workloads (Lambda, AgentCore Runtime)"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to VPC endpoints
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-workload-sg"
+
+  # =====================================================================
+  # DynamoDB
+  # =====================================================================
+  CustomersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete          # POC - use Retain for real data
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-customers"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: customerId, AttributeType: S }
+        - { AttributeName: email, AttributeType: S }
+      KeySchema:
+        - { AttributeName: customerId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - { AttributeName: email, KeyType: HASH }
+          Projection:
+            ProjectionType: KEYS_ONLY
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # =====================================================================
+  # Cognito (machine-to-machine). No user pool domain on purpose: a domain
+  # blocks user pool requests through the cognito-idp VPC endpoint. Tokens
+  # are issued with the GetClientToken API instead of /oauth2/token.
+  # =====================================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-pool"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: customer-api
+      Name: Customer API
+      Scopes:
+        - { ScopeName: customers.read, ScopeDescription: Read customers }
+        - { ScopeName: customers.write, ScopeDescription: Create customers }
+
+  # =====================================================================
+  # Deploy-time helper Lambda for both custom resources
+  #   Custom::CognitoM2MClient - app client with ALLOW_CLIENT_TOKEN_AUTH, which
+  #       AWS::Cognito::UserPoolClient doesn't accept yet. Ref = client ID.
+  #   Custom::SeedCustomers   - writes sample customers (never overwrites).
+  # =====================================================================
+  DeployHelperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: deploy-helper
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:CreateUserPoolClient
+                  - cognito-idp:UpdateUserPoolClient
+                  - cognito-idp:DeleteUserPoolClient
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt UserPool.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt CustomersTable.Arn
+
+  DeployHelperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-deploy-helper"
+      RetentionInDays: 14
+
+  DeployHelperFn:
+    Type: AWS::Lambda::Function
+    DependsOn: DeployHelperLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-deploy-helper"
+      Description: CloudFormation custom resources (Cognito M2M client, data seed)
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt DeployHelperRole.Arn
+      VpcConfig: !If
+        - HelperInVpc
+        - SubnetIds: !Ref PrivateSubnetIds
+          SecurityGroupIds: [!Ref WorkloadSecurityGroup]
+        - !Ref AWS::NoValue
+      Code:
+        ZipFile: |
+          import json, re, urllib.request
+          from decimal import Decimal
+          import boto3
+          from botocore.exceptions import ClientError
+
+          CLIENT_ID_RE = re.compile(r"^[a-z0-9]{20,128}$")
+
+          def send(event, context, status, physical_id, data=None, reason=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or f"See CloudWatch log stream {context.log_stream_name}")[:1000],
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": "", "Content-Length": str(len(body))})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  print(f"CloudFormation response {status} -> HTTP {r.status}")
+
+          # ---------- Custom::CognitoM2MClient ----------
+          def _client_cfg(p):
+              return dict(
+                  UserPoolId=p["UserPoolId"], ClientName=p["ClientName"],
+                  ExplicitAuthFlows=["ALLOW_CLIENT_TOKEN_AUTH"],   # must be the only flow
+                  AllowedOAuthFlows=["client_credentials"], AllowedOAuthFlowsUserPoolClient=True,
+                  AllowedOAuthScopes=p["Scopes"],
+                  AccessTokenValidity=int(p.get("AccessTokenValidityMinutes", 60)),
+                  TokenValidityUnits={"AccessToken": "minutes"})
+
+          def cognito_client(event):
+              idp = boto3.client("cognito-idp")
+              p, rtype = event["ResourceProperties"], event["RequestType"]
+              old = event.get("OldResourceProperties", {})
+              pid = event.get("PhysicalResourceId", "")
+
+              if rtype == "Delete":
+                  if CLIENT_ID_RE.match(pid):
+                      try:
+                          idp.delete_user_pool_client(UserPoolId=p["UserPoolId"], ClientId=pid)
+                      except ClientError as e:
+                          if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                              raise
+                  return pid, {}
+
+              replace = rtype == "Create" or any(old.get(k) != p.get(k) for k in ("UserPoolId", "ClientName"))
+              if replace:
+                  # New physical ID -> CloudFormation deletes the old client after a successful update.
+                  c = idp.create_user_pool_client(GenerateSecret=True, **_client_cfg(p))["UserPoolClient"]
+              else:
+                  c = idp.update_user_pool_client(ClientId=pid, **_client_cfg(p))["UserPoolClient"]
+              # The secret is NOT returned to CloudFormation; consumers read it from Cognito.
+              return c["ClientId"], {"ClientId": c["ClientId"]}
+
+          # ---------- Custom::SeedCustomers ----------
+          SEED = [
+              {"customerId": "C-1001", "firstName": "Alice", "lastName": "Nguyen", "email": "alice.nguyen@example.com",
+               "segment": "RETAIL", "status": "ACTIVE", "city": "Toronto", "province": "ON",
+               "accounts": [{"type": "CHEQUING", "balance": Decimal("4520.15")},
+                            {"type": "SAVINGS", "balance": Decimal("18200.00")}],
+               "createdAt": "2021-03-14T10:22:00+00:00"},
+              {"customerId": "C-1002", "firstName": "Brian", "lastName": "Okafor", "email": "brian.okafor@example.com",
+               "segment": "SMALL_BUSINESS", "status": "ACTIVE", "city": "Calgary", "province": "AB",
+               "accounts": [{"type": "BUSINESS_CHEQUING", "balance": Decimal("61234.90")}],
+               "createdAt": "2019-11-02T15:05:00+00:00"},
+              {"customerId": "C-1003", "firstName": "Chantal", "lastName": "Roy", "email": "chantal.roy@example.com",
+               "segment": "WEALTH", "status": "DORMANT", "city": "Montreal", "province": "QC",
+               "accounts": [{"type": "INVESTMENT", "balance": Decimal("250000.00")}],
+               "createdAt": "2015-06-30T09:00:00+00:00"},
+              {"customerId": "C-1004", "firstName": "Devon", "lastName": "Singh", "email": "devon.singh@example.com",
+               "segment": "RETAIL", "status": "ACTIVE", "city": "Ottawa", "province": "ON",
+               "accounts": [{"type": "CHEQUING", "balance": Decimal("812.40")},
+                            {"type": "CREDIT_CARD", "balance": Decimal("-1290.55")}],
+               "createdAt": "2023-08-21T13:40:00+00:00"},
+          ]
+
+          def seed(event):
+              if event["RequestType"] == "Delete":
+                  return event.get("PhysicalResourceId", "seed"), {}   # table is deleted with the stack
+              table = boto3.resource("dynamodb").Table(event["ResourceProperties"]["TableName"])
+              written = 0
+              for item in SEED:
+                  try:
+                      table.put_item(Item=item, ConditionExpression="attribute_not_exists(customerId)")
+                      written += 1
+                  except ClientError as e:
+                      if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                          raise
+              return f"seed-{event['ResourceProperties']['TableName']}", {"Written": str(written)}
+
+          HANDLERS = {"Custom::CognitoM2MClient": cognito_client, "Custom::SeedCustomers": seed}
+
+          def handler(event, context):
+              safe = {k: v for k, v in event.items() if k != "ResponseURL"}
+              print(json.dumps(safe))
+              pid = event.get("PhysicalResourceId") or f"failed-{event['RequestId']}"
+              try:
+                  pid, data = HANDLERS[event["ResourceType"]](event)
+                  send(event, context, "SUCCESS", pid, data)
+              except Exception as e:
+                  print(f"ERROR {type(e).__name__}: {e}")
+                  send(event, context, "FAILED", pid, reason=f"{type(e).__name__}: {e}")
+
+  CognitoM2MClient:
+    Type: Custom::CognitoM2MClient
+    DependsOn: ResourceServer          # scopes must exist before the client references them
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${ProjectName}-mcp-tools"
+      Scopes:
+        - customer-api/customers.read
+        - customer-api/customers.write
+      AccessTokenValidityMinutes: "60"
+
+  SeedCustomers:
+    Type: Custom::SeedCustomers
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      TableName: !Ref CustomersTable
+      SeedVersion: "1"                 # bump to re-run (existing IDs are never overwritten)
+
+  # =====================================================================
+  # Customer API Lambda (DynamoDB CRUD)
+  # =====================================================================
+  CustomerApiFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: customers-table
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Scan, dynamodb:Query]
+                Resource:
+                  - !GetAtt CustomersTable.Arn
+                  - !Sub "${CustomersTable.Arn}/index/*"
+
+  CustomerApiFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-api"
+      RetentionInDays: 14
+
+  CustomerApiFn:
+    Type: AWS::Lambda::Function
+    DependsOn: CustomerApiFnLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-customer-api"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt CustomerApiFnRole.Arn
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [!Ref WorkloadSecurityGroup]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CustomersTable
+      Code:
+        ZipFile: |
+          import json, os, re, uuid, datetime
+          from decimal import Decimal
+          import boto3
+          from boto3.dynamodb.conditions import Attr, Key
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+          REQUIRED = ("firstName", "lastName", "email")
+          SEGMENTS = {"RETAIL", "SMALL_BUSINESS", "WEALTH"}
+          EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+          CID_RE = re.compile(r"^C-[0-9A-F]{4,8}$")
+
+          def _json(o):
+              if isinstance(o, Decimal):
+                  return int(o) if o == o.to_integral_value() else float(o)
+              raise TypeError(type(o))
+
+          def _resp(code, body):
+              return {"statusCode": code,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps(body, default=_json)}
+
+          def list_customers(qs):
+              # POC: Scan + filter. Add GSIs for real access patterns.
+              cond = None
+              for key in ("status", "segment", "province"):
+                  if qs.get(key):
+                      c = Attr(key).eq(qs[key].upper())
+                      cond = c if cond is None else cond & c
+              kwargs = {"FilterExpression": cond} if cond is not None else {}
+              items, resp = [], table.scan(**kwargs)
+              items += resp["Items"]
+              while "LastEvaluatedKey" in resp:
+                  resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+                  items += resp["Items"]
+              items.sort(key=lambda c: c["customerId"])
+              return _resp(200, {"count": len(items), "items": items})
+
+          def get_customer(cid):
+              cid = (cid or "").upper()
+              if not CID_RE.match(cid):
+                  return _resp(400, {"message": "customerId must look like C-1001"})
+              item = table.get_item(Key={"customerId": cid}).get("Item")
+              return _resp(200, item) if item else _resp(404, {"message": f"Customer {cid} not found"})
+
+          def create_customer(raw):
+              try:
+                  body = json.loads(raw or "{}")
+              except json.JSONDecodeError:
+                  return _resp(400, {"message": "Body must be valid JSON"})
+              missing = [f for f in REQUIRED if not str(body.get(f, "")).strip()]
+              if missing:
+                  return _resp(400, {"message": f"Missing fields: {', '.join(missing)}"})
+              email = body["email"].strip().lower()
+              if not EMAIL_RE.match(email):
+                  return _resp(400, {"message": "Invalid email"})
+              segment = str(body.get("segment") or "RETAIL").upper()
+              if segment not in SEGMENTS:
+                  return _resp(400, {"message": f"segment must be one of {sorted(SEGMENTS)}"})
+              if table.query(IndexName="email-index", KeyConditionExpression=Key("email").eq(email))["Items"]:
+                  return _resp(409, {"message": f"A customer with email {email} already exists"})
+              item = {
+                  "customerId": f"C-{uuid.uuid4().hex[:6].upper()}",
+                  "firstName": body["firstName"].strip(), "lastName": body["lastName"].strip(),
+                  "email": email, "segment": segment, "status": "PENDING_KYC",
+                  "accounts": [],
+                  "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+              }
+              for opt in ("city", "province"):
+                  if body.get(opt):
+                      item[opt] = str(body[opt]).strip().upper() if opt == "province" else str(body[opt]).strip()
+              table.put_item(Item=item, ConditionExpression="attribute_not_exists(customerId)")
+              return _resp(201, item)
+
+          def handler(event, context):
+              claims = (event.get("requestContext", {}).get("authorizer") or {}).get("claims", {})
+              print(json.dumps({"method": event.get("httpMethod"), "resource": event.get("resource"),
+                                "client_id": claims.get("client_id"), "scope": claims.get("scope")}))
+              method, resource = event.get("httpMethod"), event.get("resource")
+              try:
+                  if method == "GET" and resource == "/customers":
+                      return list_customers(event.get("queryStringParameters") or {})
+                  if method == "GET" and resource == "/customers/{customerId}":
+                      return get_customer((event.get("pathParameters") or {}).get("customerId"))
+                  if method == "POST" and resource == "/customers":
+                      return create_customer(event.get("body"))
+                  return _resp(405, {"message": f"{method} {resource} not supported"})
+              except Exception as e:
+                  print(f"ERROR {type(e).__name__}: {e}")
+                  return _resp(500, {"message": "Internal error"})
+
+  # =====================================================================
+  # API Gateway (private REST + Cognito authorizer)
+  # =====================================================================
+  CustomerApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-customer-api"
+      Description: Private customer API (Cognito-protected) for the AgentCore MCP POC
+      EndpointConfiguration:
+        Types: [PRIVATE]
+        VpcEndpointIds: [!Ref ExecuteApiVpceId]
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: execute-api:Invoke
+            Resource: execute-api:/*
+          - Effect: Deny
+            Principal: "*"
+            Action: execute-api:Invoke
+            Resource: execute-api:/*
+            Condition:
+              StringNotEquals:
+                aws:SourceVpce: !Ref ExecuteApiVpceId
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: cognito-m2m
+      RestApiId: !Ref CustomerApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs: [!GetAtt UserPool.Arn]
+
+  CustomersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ParentId: !GetAtt CustomerApi.RootResourceId
+      PathPart: customers
+
+  CustomerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ParentId: !Ref CustomersResource
+      PathPart: "{customerId}"
+
+  ListCustomersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ResourceId: !Ref CustomersResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      AuthorizationScopes: [customer-api/customers.read]
+      RequestParameters:
+        method.request.querystring.status: false
+        method.request.querystring.segment: false
+        method.request.querystring.province: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerApiFn.Arn}/invocations"
+
+  CreateCustomerMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ResourceId: !Ref CustomersResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      AuthorizationScopes: [customer-api/customers.write]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerApiFn.Arn}/invocations"
+
+  GetCustomerMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ResourceId: !Ref CustomerIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      AuthorizationScopes: [customer-api/customers.read]
+      RequestParameters:
+        method.request.path.customerId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerApiFn.Arn}/invocations"
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CustomerApiFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomerApi}/*/*/*"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ListCustomersMethod, CreateCustomerMethod, GetCustomerMethod]
+    Properties:
+      RestApiId: !Ref CustomerApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CustomerApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+
+  # =====================================================================
+  # MCP tool Lambda (Gateway target) - Cognito M2M token -> private API
+  # =====================================================================
+  ToolFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: read-app-client-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Secret is read from Cognito at cold start - never stored in env vars,
+              # templates, stack outputs or Secrets Manager.
+              - Effect: Allow
+                Action: cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt UserPool.Arn
+
+  ToolFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-tools"
+      RetentionInDays: 14
+
+  ToolFn:
+    Type: AWS::Lambda::Function
+    DependsOn: ToolFnLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-customer-tools"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ToolFnRole.Arn
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [!Ref WorkloadSecurityGroup]
+      Environment:
+        Variables:
+          API_BASE_URL: !Sub "https://${CustomerApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref CognitoM2MClient
+          TOKEN_SCOPES: customer-api/customers.read customer-api/customers.write
+      Code:
+        ZipFile: |
+          import json, os, time, urllib.request, urllib.error, urllib.parse
+          import boto3
+
+          BASE = os.environ["API_BASE_URL"].rstrip("/")
+          REGION = os.environ["AWS_REGION"]
+          POOL_ID, CLIENT_ID = os.environ["USER_POOL_ID"], os.environ["CLIENT_ID"]
+          SCOPES = os.environ["TOKEN_SCOPES"].split()
+          # Regional cognito-idp hostname -> resolves to the cognito-idp VPC endpoint (private DNS)
+          IDP_URL = f"https://cognito-idp.{REGION}.amazonaws.com/"
+          DELIM = "___"  # Gateway sends "<targetName>___<toolName>"
+
+          _secret = None
+          _token = {"value": None, "exp": 0}
+
+          def _client_secret():
+              global _secret
+              if _secret is None:
+                  idp = boto3.client("cognito-idp")
+                  _secret = idp.describe_user_pool_client(
+                      UserPoolId=POOL_ID, ClientId=CLIENT_ID)["UserPoolClient"]["ClientSecret"]
+              return _secret
+
+          def _access_token():
+              # Cognito GetClientToken: M2M token without a user pool domain (works over
+              # PrivateLink, unlike /oauth2/token). Raw JSON call so it doesn't depend on
+              # the Lambda runtime's bundled boto3 version. Not SigV4 - auth is id+secret.
+              if _token["value"] and time.time() < _token["exp"] - 60:
+                  return _token["value"]
+              req = urllib.request.Request(
+                  IDP_URL, method="POST",
+                  data=json.dumps({"ClientId": CLIENT_ID, "Secret": _client_secret(), "Scopes": SCOPES}).encode(),
+                  headers={"Content-Type": "application/x-amz-json-1.1",
+                           "X-Amz-Target": "AWSCognitoIdentityProviderService.GetClientToken"})
+              with urllib.request.urlopen(req, timeout=5) as r:
+                  res = json.loads(r.read())["ClientAuthenticationResult"]
+              _token.update(value=res["AccessToken"], exp=time.time() + int(res["ExpiresIn"]))
+              return _token["value"]
+
+          def _call(method, path, body=None, query=None):
+              url = BASE + path
+              if query:
+                  q = {k: v for k, v in query.items() if v}
+                  if q:
+                      url += "?" + urllib.parse.urlencode(q)
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(url, data=data, method=method, headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {_access_token()}"})
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      return {"status": r.status, "data": json.loads(r.read() or b"{}")}
+              except urllib.error.HTTPError as e:
+                  if e.code == 401:
+                      _token["value"] = None  # force refresh next call
+                  try:
+                      err = json.loads(e.read() or b"{}")
+                  except ValueError:
+                      err = {"message": e.reason}
+                  return {"status": e.code, "error": err}
+
+          def handler(event, context):
+              cc = getattr(context, "client_context", None)
+              full = (cc.custom or {}).get("bedrockAgentCoreToolName", "") if cc else ""
+              tool = full.split(DELIM, 1)[-1]
+              print(json.dumps({"tool": tool, "args": event}))
+
+              if tool == "list_customers":
+                  return _call("GET", "/customers", query={k: event.get(k) for k in ("status", "segment", "province")})
+              if tool == "get_customer":
+                  cid = urllib.parse.quote(str(event.get("customerId", "")), safe="")
+                  return _call("GET", f"/customers/{cid}")
+              if tool == "create_customer":
+                  allowed = ("firstName", "lastName", "email", "segment", "city", "province")
+                  return _call("POST", "/customers", body={k: event[k] for k in allowed if k in event})
+              return {"status": 400, "error": {"message": f"Unknown tool '{tool}'"}}
+
+  # =====================================================================
+  # AgentCore Gateway (MCP)
+  # =====================================================================
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-tool-lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ToolFn.Arn
+
+  McpGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub "${ProjectName}-gw"
+      Description: MCP gateway exposing customer API tools
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt GatewayRole.Arn
+      ExceptionLevel: DEBUG   # POC only - remove for anything beyond a POC
+
+  CustomerToolsTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt McpGateway.GatewayIdentifier
+      Name: customer-tools
+      Description: Customer API (GET/POST) via Lambda
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt ToolFn.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: list_customers
+                  Description: List customers, optionally filtered by status, segment or province.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      status:
+                        Type: string
+                        Description: ACTIVE, DORMANT or PENDING_KYC
+                      segment:
+                        Type: string
+                        Description: RETAIL, SMALL_BUSINESS or WEALTH
+                      province:
+                        Type: string
+                        Description: Two-letter Canadian province code, e.g. ON
+                - Name: get_customer
+                  Description: Get a single customer's profile and accounts by customer ID (e.g. C-1001).
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      customerId:
+                        Type: string
+                        Description: Customer ID, format C-XXXX
+                    Required: [customerId]
+                - Name: create_customer
+                  Description: Create (onboard) a new customer. Returns the new customer with status PENDING_KYC.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      firstName: { Type: string }
+                      lastName: { Type: string }
+                      email: { Type: string }
+                      segment:
+                        Type: string
+                        Description: RETAIL (default), SMALL_BUSINESS or WEALTH
+                      city: { Type: string }
+                      province: { Type: string }
+                    Required: [firstName, lastName, email]
+
+  # =====================================================================
+  # AgentCore Runtime (Strands agent, VPC mode)
+  # =====================================================================
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+      Policies:
+        - PolicyName: agent-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Bedrock
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Sid: InvokeGateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !GetAtt McpGateway.GatewayArn
+              - Sid: AgentCode
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${AgentCodeKey}"
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams, logs:DescribeLogGroups]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: Observability
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+                Resource: "*"
+                Condition:
+                  StringEqualsIfExists: { cloudwatch:namespace: bedrock-agentcore }
+
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Join ["_", !Split ["-", !Sub "${ProjectName}_agent"]]
+      Description: Strands agent calling customer API tools through AgentCore Gateway (MCP)
+      RoleArn: !GetAtt RuntimeRole.Arn
+      ProtocolConfiguration: HTTP
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Runtime: PYTHON_3_12
+          EntryPoint: [main.py]
+          Code:
+            S3:
+              Bucket: !Ref ArtifactBucket
+              Prefix: !Ref AgentCodeKey
+      NetworkConfiguration:
+        NetworkMode: VPC
+        NetworkModeConfig:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref WorkloadSecurityGroup]
+      EnvironmentVariables:
+        GATEWAY_URL: !GetAtt McpGateway.GatewayUrl
+        MODEL_ID: !Ref ModelId
+        AWS_REGION_NAME: !Ref AWS::Region
+
+Outputs:
+  AgentRuntimeArn:
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+  GatewayUrl:
+    Value: !GetAtt McpGateway.GatewayUrl
+  CustomerApiId:
+    Value: !Ref CustomerApi
+  CustomerApiBaseUrl:
+    Description: Resolves only inside the VPC (execute-api private DNS)
+    Value: !Sub "https://${CustomerApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+  CustomersTableName:
+    Value: !Ref CustomersTable
+  UserPoolId:
+    Value: !Ref UserPool
+  ToolsAppClientId:
+    Value: !Ref CognitoM2MClient
+  ToolFunctionName:
+    Value: !Ref ToolFn
+  WorkloadSecurityGroupId:
+    Description: Endpoint security groups must allow 443 from this SG (or the VPC CIDR)
+    Value: !Ref WorkloadSecurityGroup

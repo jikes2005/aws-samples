@@ -1,0 +1,8 @@
+# Pinned to major versions tested with main.py.
+# mcp 2.x renamed streamablehttp_client and moved to httpx2 - main.py's SigV4
+# signer targets the 1.x API, so stay on mcp 1.x until main.py is ported.
+bedrock-agentcore>=1.0.0,<2
+strands-agents>=1.10.0,<2
+mcp>=1.23.0,<2
+httpx>=0.28.1,<1
+boto3>=1.40.0
