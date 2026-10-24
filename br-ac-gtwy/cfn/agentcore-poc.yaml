@@ -1119,50 +1119,102 @@ Resources:
           USER_POOL_ID: !Ref UserPool
           CLIENT_ID: !Ref CognitoM2MClient
           TOKEN_SCOPES: customer-api/customers.read customer-api/customers.write
+          LOG_LEVEL: INFO              # DEBUG adds botocore wire-level logs
       Code:
         ZipFile: |
-          import json, logging, os, socket, time, urllib.request, urllib.error, urllib.parse
+          import ipaddress, json, logging, os, socket, threading, time, urllib.request, urllib.error, urllib.parse
           import boto3
           from botocore.config import Config
 
           log = logging.getLogger()
-          log.setLevel(logging.INFO)
+          log.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+          if os.environ.get("LOG_LEVEL") == "DEBUG":
+              boto3.set_stream_logger("botocore", logging.DEBUG)
 
           BASE = os.environ["API_BASE_URL"].rstrip("/")
           REGION = os.environ["AWS_REGION"]
           POOL_ID, CLIENT_ID = os.environ["USER_POOL_ID"], os.environ["CLIENT_ID"]
           SCOPES = os.environ["TOKEN_SCOPES"].split()
-          # Regional cognito-idp hostname -> resolves to the cognito-idp VPC endpoint (private DNS)
-          IDP_URL = f"https://cognito-idp.{REGION}.amazonaws.com/"
+          IDP_HOST = f"cognito-idp.{REGION}.amazonaws.com"
+          IDP_URL = f"https://{IDP_HOST}/"
+          API_HOST = urllib.parse.urlparse(BASE).hostname
           DELIM = "___"  # Gateway sends "<targetName>___<toolName>"
 
-          # Short timeouts so a blocked network path fails fast with a clear message
-          # instead of hanging until the Lambda times out.
+          log.info("config: api=%s pool=%s client=%s region=%s", BASE, POOL_ID, CLIENT_ID, REGION)
+
+          # Short timeouts so a blocked path fails fast instead of hanging until the Lambda times out.
           idp = boto3.client("cognito-idp", config=Config(connect_timeout=3, read_timeout=5,
-                                                          retries={"max_attempts": 2}))
+                                                          retries={"max_attempts": 1}))
           _secret = None
           _token = {"value": None, "exp": 0}
+          _probes = {}
 
 
           class Blocked(Exception):
-              """A network call from the VPC timed out or failed to connect."""
+              """A network call from the VPC can't get through."""
 
 
           def _ms(t):
               return int((time.time() - t) * 1000)
 
 
+          # ---------------------------------------------------------------------------
+          # Network check: DNS (with its own timeout - socket timeouts don't cover DNS)
+          # and a TCP connect on 443. Runs once per host per cold start and is logged.
+          # ---------------------------------------------------------------------------
+          def probe(host, endpoint_name):
+              if host in _probes:
+                  return _probes[host]
+              t = time.time()
+              box = {}
+
+              def resolve():
+                  try:
+                      box["ips"] = sorted({a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)})
+                  except Exception as e:
+                      box["err"] = e
+
+              th = threading.Thread(target=resolve, daemon=True)
+              th.start()
+              th.join(3)
+              if th.is_alive():
+                  problem = f"DNS lookup of {host} timed out after 3 s"
+              elif "err" in box:
+                  problem = f"DNS lookup of {host} failed ({box['err']})"
+              else:
+                  ips = box["ips"]
+                  kinds = ["private" if ipaddress.ip_address(ip).is_private else "PUBLIC" for ip in ips]
+                  log.info("net: %s -> %s in %d ms", host, ", ".join(f"{ip} ({k})" for ip, k in zip(ips, kinds)), _ms(t))
+                  problem = None
+                  if "PUBLIC" in kinds:
+                      log.warning("net: %s resolves to public IPs - the %s VPC endpoint's private DNS is off "
+                                  "(or there is no endpoint), so traffic only works via a NAT", host, endpoint_name)
+                  t2 = time.time()
+                  try:
+                      socket.create_connection((ips[0], 443), timeout=3).close()
+                      log.info("net: TCP 443 to %s (%s) ok in %d ms", ips[0], host, _ms(t2))
+                  except Exception as e:
+                      problem = f"TCP 443 to {ips[0]} ({host}) failed after {_ms(t2)} ms ({e})"
+              if problem:
+                  problem += (f". Check the {endpoint_name} VPC endpoint: private DNS enabled, in this Lambda's "
+                              "subnets/AZs, and its security group allows 443 from the VPC range")
+                  log.error("net: %s", problem)
+              _probes[host] = problem
+              return problem
+
+
           def _client_secret():
               global _secret
               if _secret is None:
+                  if (p := probe(IDP_HOST, "cognito-idp")):
+                      raise Blocked(p)
+                  log.info("cognito: DescribeUserPoolClient ...")
                   t = time.time()
                   try:
                       _secret = idp.describe_user_pool_client(
                           UserPoolId=POOL_ID, ClientId=CLIENT_ID)["UserPoolClient"]["ClientSecret"]
                   except Exception as e:
-                      if "timeout" in str(e).lower() or "connect" in str(e).lower():
-                          raise Blocked(f"Cognito DescribeUserPoolClient ({IDP_URL}): {e}. "
-                                        "Check the cognito-idp VPC endpoint (private DNS, SG 443 from the VPC range)")
+                      log.error("cognito: DescribeUserPoolClient failed after %d ms: %s: %s", _ms(t), type(e).__name__, e)
                       raise
                   log.info("cognito: client secret loaded in %d ms", _ms(t))
               return _secret
@@ -1173,8 +1225,10 @@ Resources:
               # PrivateLink, unlike /oauth2/token). Raw JSON call so it does not depend on
               # the Lambda runtime's bundled boto3 version. Not SigV4 - auth is id+secret.
               if _token["value"] and time.time() < _token["exp"] - 60:
+                  log.info("cognito: reusing cached access token")
                   return _token["value"]
               secret = _client_secret()
+              log.info("cognito: GetClientToken scopes=%s ...", SCOPES)
               t = time.time()
               req = urllib.request.Request(
                   IDP_URL, method="POST",
@@ -1185,12 +1239,13 @@ Resources:
                   with urllib.request.urlopen(req, timeout=5) as r:
                       res = json.loads(r.read())["ClientAuthenticationResult"]
               except urllib.error.HTTPError as e:
-                  raise RuntimeError(f"Cognito GetClientToken HTTP {e.code}: {e.read()[:300]!r}")
+                  body = e.read()[:300]
+                  log.error("cognito: GetClientToken HTTP %d after %d ms: %r", e.code, _ms(t), body)
+                  raise RuntimeError(f"Cognito GetClientToken HTTP {e.code}: {body!r}")
               except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
-                  raise Blocked(f"Cognito GetClientToken ({IDP_URL}): {e}. "
-                                "Check the cognito-idp VPC endpoint (private DNS, SG 443 from the VPC range)")
+                  raise Blocked(f"Cognito GetClientToken ({IDP_URL}) failed after {_ms(t)} ms: {e}")
               _token.update(value=res["AccessToken"], exp=time.time() + int(res["ExpiresIn"]))
-              log.info("cognito: access token issued in %d ms", _ms(t))
+              log.info("cognito: access token issued in %d ms (expires in %ss)", _ms(t), res["ExpiresIn"])
               return _token["value"]
 
 
@@ -1200,35 +1255,44 @@ Resources:
                   q = {k: v for k, v in query.items() if v}
                   if q:
                       url += "?" + urllib.parse.urlencode(q)
+              token = _access_token()
+              if (p := probe(API_HOST, "execute-api")):
+                  raise Blocked(p)
               data = json.dumps(body).encode() if body is not None else None
               req = urllib.request.Request(url, data=data, method=method, headers={
-                  "Content-Type": "application/json",
-                  "Authorization": f"Bearer {_access_token()}"})
+                  "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+              log.info("api: %s %s body=%s ...", method, url, (data or b"")[:300].decode())
               t = time.time()
               try:
                   with urllib.request.urlopen(req, timeout=12) as r:
-                      log.info("api: %s %s -> %d in %d ms", method, path, r.status, _ms(t))
-                      return {"status": r.status, "data": json.loads(r.read() or b"{}")}
+                      raw = r.read()
+                      log.info("api: %s %s -> %d in %d ms (%d bytes)", method, path, r.status, _ms(t), len(raw))
+                      return {"status": r.status, "data": json.loads(raw or b"{}")}
               except urllib.error.HTTPError as e:
-                  log.warning("api: %s %s -> %d in %d ms", method, path, e.code, _ms(t))
+                  raw = e.read() or b"{}"
+                  log.warning("api: %s %s -> %d in %d ms: %s (x-amzn-errortype=%s, apigw request id=%s)", method, path,
+                              e.code, _ms(t), raw[:300], e.headers.get("x-amzn-errortype"), e.headers.get("x-amzn-requestid"))
                   if e.code == 401:
                       _token["value"] = None  # force refresh next call
+                  if e.code == 403:
+                      log.warning("api: 403 usually means the request didn't arrive through the execute-api endpoint the "
+                                  "API is pinned to (ExecuteApiVpceId), or the token lacks the method's scope")
                   try:
-                      err = json.loads(e.read() or b"{}")
+                      err = json.loads(raw)
                   except ValueError:
                       err = {"message": e.reason}
                   return {"status": e.code, "error": err}
               except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
-                  raise Blocked(f"Customer API {method} {url}: {e}. Check the execute-api VPC endpoint "
-                                "(private DNS, SG 443 from the VPC range) and that it is the endpoint the API is "
-                                "pinned to (ExecuteApiVpceId). A 504 or slow response points at the API Lambda / DynamoDB")
+                  raise Blocked(f"Customer API {method} {url} failed after {_ms(t)} ms: {e}. A slow 504 points at the "
+                                "API Lambda / DynamoDB; a connect error at the execute-api endpoint")
 
 
           def handler(event, context):
               cc = getattr(context, "client_context", None)
               full = (cc.custom or {}).get("bedrockAgentCoreToolName", "") if cc else ""
               tool = full.split(DELIM, 1)[-1]
-              log.info("tool=%s args=%s", tool, json.dumps(event)[:500])
+              log.info("tool=%s args=%s (time left %d ms)", tool, json.dumps(event, separators=(",", ":"))[:500],
+                       context.get_remaining_time_in_millis())
               t = time.time()
               try:
                   if tool == "list_customers":
@@ -1247,7 +1311,8 @@ Resources:
               except Exception as e:
                   log.exception("tool %s failed", tool)
                   out = {"status": 500, "error": {"message": f"{type(e).__name__}: {e}"}}
-              log.info("tool=%s status=%s in %d ms", tool, out.get("status"), _ms(t))
+              log.info("tool=%s status=%s in %d ms result=%s", tool, out.get("status"), _ms(t),
+                       json.dumps(out, separators=(",", ":"))[:500])
               return out
 
   # =====================================================================
