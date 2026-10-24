@@ -22,7 +22,7 @@ log = logging.getLogger("customer-agent")
 
 GATEWAY_URL = os.environ["GATEWAY_URL"]
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
-REGION = os.environ.get("AWS_REGION_NAME") or os.environ.get("AWS_REGION", "us-east-1")
+REGION = os.environ.get("AWS_REGION_NAME") or os.environ.get("AWS_REGION", "ca-central-1")
 
 SYSTEM_PROMPT = """You are a customer-service assistant for a Canadian bank (demo data only).
 Use the customer tools to look up, list, or create customers. Never invent customer

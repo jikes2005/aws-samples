@@ -44,7 +44,9 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and 
 
 ## Prerequisites — what must already exist
 
-**VPC endpoints** (interface endpoints with private DNS unless noted). Their security groups must allow inbound 443 from the workload SG the stack creates, or from the VPC CIDR.
+**VPC endpoints** (interface endpoints with private DNS unless noted). Their security groups must allow inbound 443 **from the VPC's address range**. For this VPC that's one rule for `172.16.0.0/20`, which covers all four of its CIDR blocks (`172.16.0.0/21`, `172.16.8.0/22`, `172.16.12.0/23`, `172.16.14.0/24`).
+
+Don't allow 443 from the stack's workload security group instead. That rule would make the shared endpoint security groups depend on this stack, and the stack delete would fail with *"WorkloadSecurityGroup has a dependent object"* until the rule is removed. Access to the endpoints is still controlled by IAM and endpoint policies.
 
 | Endpoint | Used by |
 |---|---|
@@ -58,7 +60,8 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and 
 
 Also needed:
 - AWS CLI v2, Python 3.12 + pip, `zip`
-- A region where AgentCore Runtime, Gateway and their PrivateLink endpoints are available (us-east-1 / us-west-2 / eu-central-1 are safest)
+- A region where AgentCore Runtime and Gateway are available. This POC targets **ca-central-1**.
+- **Model:** the default `MODEL_ID` is a `us.` cross-region inference profile. It works from ca-central-1, but requests are processed in US regions (us-east-1, us-east-2, us-west-2 or ca-central-1). `global.` profiles may route worldwide. Check this against your data-residency requirements.
 - Bedrock model access for `MODEL_ID` (default is a Claude Sonnet inference profile; swap for one your account has enabled)
 - An existing S3 bucket for the agent zip
 - Private subnets in 2+ AZs that AgentCore Runtime supports (if runtime creation fails with a subnet/AZ error, pick subnets in other AZs)
@@ -66,7 +69,7 @@ Also needed:
 ## Deploy
 
 ```bash
-export AWS_REGION=us-east-1
+export AWS_REGION=ca-central-1
 export VPC_ID=vpc-xxxxxxxx
 export SUBNET_IDS=subnet-aaaa,subnet-bbbb
 export EXECUTE_API_VPCE=vpce-xxxxxxxx

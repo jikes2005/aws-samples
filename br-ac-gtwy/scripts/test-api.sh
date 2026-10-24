@@ -4,7 +4,7 @@
 # have `cognito-idp get-client-token` and IAM permission for DescribeUserPoolClient.
 set -euo pipefail
 PROJECT="${PROJECT:-agentcore-poc}"
-REGION="${AWS_REGION:-us-east-1}"
+REGION="${AWS_REGION:-ca-central-1}"
 
 out() { aws cloudformation describe-stacks --region "$REGION" --stack-name "$PROJECT" \
           --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }

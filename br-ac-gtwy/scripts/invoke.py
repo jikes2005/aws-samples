@@ -11,7 +11,7 @@ import uuid
 import boto3
 
 STACK = os.environ.get("PROJECT", "agentcore-poc")
-REGION = boto3.Session().region_name or "us-east-1"
+REGION = boto3.Session().region_name or "ca-central-1"
 
 cfn = boto3.client("cloudformation", region_name=REGION)
 outputs = cfn.describe_stacks(StackName=STACK)["Stacks"][0]["Outputs"]

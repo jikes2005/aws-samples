@@ -1362,7 +1362,8 @@ Resources:
                 Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
                 Resource:
                   - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
-                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+                  # System cross-region profiles (us./global.) may be addressed with or without an account ID
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/*"
               - Sid: InvokeGateway
                 Effect: Allow
                 Action: bedrock-agentcore:InvokeGateway
@@ -1641,5 +1642,5 @@ Outputs:
   ApiAccessLogGroup:
     Value: !Ref ApiAccessLogGroup
   WorkloadSecurityGroupId:
-    Description: Endpoint security groups must allow 443 from this SG (or the VPC CIDR)
+    Description: Workload SG. Endpoint SGs should allow 443 from the VPC range (172.16.0.0/20), not reference this SG (a reference blocks stack deletion)
     Value: !Ref WorkloadSecurityGroup

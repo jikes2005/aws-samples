@@ -4,7 +4,7 @@
 #   ./scripts/test-agent.sh "Show me customer C-1003"   # one question
 set -euo pipefail
 PROJECT="${PROJECT:-agentcore-poc}"
-REGION="${AWS_REGION:-us-east-1}"
+REGION="${AWS_REGION:-ca-central-1}"
 FN="$PROJECT-agent-test"
 OUT="$(mktemp)"; trap 'rm -f "$OUT"' EXIT
 

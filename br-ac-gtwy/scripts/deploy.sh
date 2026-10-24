@@ -7,7 +7,7 @@
 set -euo pipefail
 
 PROJECT="${PROJECT:-agentcore-poc}"
-REGION="${AWS_REGION:-us-east-1}"
+REGION="${AWS_REGION:-ca-central-1}"
 VPC_ID="${VPC_ID:?set VPC_ID}"
 SUBNET_IDS="${SUBNET_IDS:?set SUBNET_IDS, comma-separated private subnets}"
 EXECUTE_API_VPCE="${EXECUTE_API_VPCE:?set EXECUTE_API_VPCE (existing execute-api endpoint, vpce-...)}"
