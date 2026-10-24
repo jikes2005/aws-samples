@@ -15,7 +15,7 @@ Metadata:
       - Label: { default: Agent }
         Parameters: [ArtifactBucket, AgentCodeKey, ModelId]
       - Label: { default: "Encryption, backup and API controls" }
-        Parameters: [ExistingKmsKeyArn, CreateApiGatewayAccountRole, TestFunctionInVpc]
+        Parameters: [ExistingKmsKeyArn, CreateApiGatewayAccountRole]
       - Label: { default: Required tags }
         Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
       - Label: { default: General }
@@ -55,13 +55,6 @@ Parameters:
     Description: >
       Leave blank to create a customer managed key for this stack. To use an existing CMK,
       give its key ARN (not an alias) and add the key policy statements from the README.
-  TestFunctionInVpc:
-    Type: String
-    AllowedValues: ["true", "false"]
-    Default: "true"
-    Description: >
-      Run the agent test Lambda in the VPC. Needs the AgentCore data-plane interface
-      endpoint (com.amazonaws.<region>.bedrock-agentcore). Set false if the VPC doesn't have it.
   CreateApiGatewayAccountRole:
     Type: String
     AllowedValues: ["true", "false"]
@@ -92,7 +85,6 @@ Parameters:
 Conditions:
   CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
   CreateApiGwAccount: !Equals [!Ref CreateApiGatewayAccountRole, "true"]
-  TestFnInVpc: !Equals [!Ref TestFunctionInVpc, "true"]
 
 Resources:
   # =====================================================================
@@ -1417,202 +1409,6 @@ Resources:
         MODEL_ID: !Ref ModelId
         AWS_REGION_NAME: !Ref AWS::Region
 
-  # =====================================================================
-  # Agent test Lambda - invoke it to exercise the deployed agent end to end
-  #   {}                          -> runs the built-in test suite
-  #   {"prompt": "..."}           -> asks one question
-  #   {"prompts": ["...", ...]}   -> asks several questions
-  # =====================================================================
-  AgentTestFnRole:
-    Type: AWS::IAM::Role
-    Properties:
-      Tags:
-        - Key: AppCatID
-          Value: !Ref AppCatID
-        - Key: Description
-          Value: "Role for the agent test Lambda"
-        - Key: ServiceName
-          Value: !Ref ServiceName
-        - Key: Support-Team
-          Value: !Ref SupportTeam
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: !Ref ProjectName
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
-      Policies:
-        - PolicyName: invoke-agent
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: bedrock-agentcore:InvokeAgentRuntime
-                Resource:
-                  - !GetAtt AgentRuntime.AgentRuntimeArn
-                  - !Sub "${AgentRuntime.AgentRuntimeArn}/runtime-endpoint/*"
-              - Sid: DecryptEnvVars
-                Effect: Allow
-                Action: kms:Decrypt
-                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-
-  AgentTestFnLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      Tags:
-        - Key: AppCatID
-          Value: !Ref AppCatID
-        - Key: Description
-          Value: "Logs for the agent test Lambda"
-        - Key: ServiceName
-          Value: !Ref ServiceName
-        - Key: Support-Team
-          Value: !Ref SupportTeam
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: !Ref ProjectName
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-agent-test"
-      RetentionInDays: 14
-      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-
-  AgentTestFn:
-    Type: AWS::Lambda::Function
-    DependsOn: AgentTestFnLogGroup
-    Properties:
-      Tags:
-        - Key: AppCatID
-          Value: !Ref AppCatID
-        - Key: Description
-          Value: "Invokes the agent to test it end to end"
-        - Key: ServiceName
-          Value: !Ref ServiceName
-        - Key: Support-Team
-          Value: !Ref SupportTeam
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: !Ref ProjectName
-      FunctionName: !Sub "${ProjectName}-agent-test"
-      Description: Invokes the AgentCore Runtime agent with test prompts and checks the answers
-      Runtime: python3.12
-      Architectures: [arm64]
-      Handler: index.handler
-      Timeout: 600
-      MemorySize: 256
-      Role: !GetAtt AgentTestFnRole.Arn
-      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-      VpcConfig: !If
-        - TestFnInVpc
-        - SubnetIds: !Ref PrivateSubnetIds
-          SecurityGroupIds: [!Ref WorkloadSecurityGroup]
-        - !Ref AWS::NoValue
-      Environment:
-        Variables:
-          AGENT_RUNTIME_ARN: !GetAtt AgentRuntime.AgentRuntimeArn
-          QUALIFIER: DEFAULT
-      Code:
-        ZipFile: |
-          import json, os, time, uuid, urllib.parse, urllib.request
-          import boto3
-          from botocore.auth import SigV4Auth
-          from botocore.awsrequest import AWSRequest
-          from botocore.config import Config
-          from botocore.exceptions import UnknownServiceError
-
-          ARN = os.environ["AGENT_RUNTIME_ARN"]
-          QUALIFIER = os.environ.get("QUALIFIER", "DEFAULT")
-          REGION = os.environ["AWS_REGION"]
-          session = boto3.Session()
-
-          # Use the SDK client when the Lambda runtime's boto3 includes bedrock-agentcore;
-          # otherwise fall back to a SigV4-signed HTTPS call (same API, any boto3 version).
-          try:
-              client = session.client("bedrock-agentcore", config=Config(
-                  connect_timeout=10, read_timeout=280, retries={"max_attempts": 1}))
-          except UnknownServiceError:
-              client = None
-              print("boto3 has no bedrock-agentcore client - using signed HTTPS requests")
-
-          def _invoke_raw(session_id, payload):
-              url = (f"https://bedrock-agentcore.{REGION}.amazonaws.com/runtimes/"
-                     f"{urllib.parse.quote(ARN, safe='')}/invocations?qualifier={QUALIFIER}")
-              headers = {"Content-Type": "application/json", "Accept": "application/json",
-                         "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id}
-              req = AWSRequest(method="POST", url=url, data=payload, headers=headers)
-              SigV4Auth(session.get_credentials().get_frozen_credentials(), "bedrock-agentcore", REGION).add_auth(req)
-              http = urllib.request.Request(url, data=payload, method="POST", headers=dict(req.headers))
-              with urllib.request.urlopen(http, timeout=280) as r:
-                  return r.headers.get("Content-Type", ""), r.read()
-
-          # Built-in suite against the seeded sample data. A check passes when the answer
-          # contains any of the expected strings (case-insensitive). Built per call so the
-          # "create" case always uses a fresh email (a reused one would hit the 409 duplicate check).
-          def suite():
-              return [
-                  {"name": "list with filter", "prompt": "List the active customers in Ontario.",
-                   "expect_any": ["C-1001", "Alice"]},
-                  {"name": "get by id", "prompt": "What accounts does customer C-1002 have and what is the total balance?",
-                   "expect_any": ["61,234", "61234"]},
-                  {"name": "not found", "prompt": "Show me customer C-9999.",
-                   "expect_any": ["not found", "doesn't exist", "does not exist", "no customer", "couldn't find", "could not find"]},
-                  {"name": "create", "prompt": f"Onboard a new retail customer: Test User, test.user.{uuid.uuid4().hex[:6]}@example.com, Ottawa ON.",
-                   "expect_any": ["PENDING_KYC", "pending KYC"]},
-              ]
-
-          def ask(prompt, session_id=None):
-              session_id = session_id or f"agent-test-{uuid.uuid4()}"     # must be >= 33 chars
-              t0 = time.time()
-              payload = json.dumps({"prompt": prompt}).encode()
-              if client:
-                  resp = client.invoke_agent_runtime(agentRuntimeArn=ARN, qualifier=QUALIFIER,
-                                                     runtimeSessionId=session_id, payload=payload)
-                  ctype, body = resp.get("contentType", ""), resp["response"].read()
-              else:
-                  ctype, body = _invoke_raw(session_id, payload)
-              raw = body.decode("utf-8", "replace")
-              text = raw
-              if "text/event-stream" in ctype:
-                  text = "".join(l[5:].strip() for l in raw.splitlines() if l.startswith("data:"))
-              try:
-                  text = json.loads(text).get("result", text)
-              except (ValueError, AttributeError):
-                  pass
-              return {"answer": text, "seconds": round(time.time() - t0, 1), "sessionId": session_id}
-
-          def handler(event, context):
-              event = event or {}
-              if event.get("prompt"):
-                  cases = [{"name": "custom", "prompt": event["prompt"]}]
-              elif event.get("prompts"):
-                  cases = [{"name": f"custom-{i + 1}", "prompt": p} for i, p in enumerate(event["prompts"])]
-              else:
-                  cases = suite()
-              results = []
-              for c in cases:
-                  if context.get_remaining_time_in_millis() < 60_000:
-                      results.append({"name": c["name"], "status": "SKIPPED", "reason": "out of time"})
-                      continue
-                  try:
-                      r = ask(c["prompt"], event.get("sessionId"))
-                      exp = c.get("expect_any")
-                      ok = None if exp is None else any(e.lower() in str(r["answer"]).lower() for e in exp)
-                      status = "ANSWERED" if ok is None else ("PASS" if ok else "FAIL")
-                      results.append({"name": c["name"], "status": status, "prompt": c["prompt"], **r})
-                  except Exception as e:
-                      results.append({"name": c["name"], "status": "ERROR", "prompt": c["prompt"],
-                                      "error": f"{type(e).__name__}: {e}"})
-                  print(json.dumps(results[-1])[:4000])
-              summary = {s: sum(1 for r in results if r["status"] == s)
-                         for s in ("PASS", "FAIL", "ERROR", "ANSWERED", "SKIPPED") if any(r["status"] == s for r in results)}
-              return {"agentRuntimeArn": ARN, "summary": summary, "results": results}
-
 Outputs:
   AgentRuntimeArn:
     Value: !GetAtt AgentRuntime.AgentRuntimeArn
@@ -1631,9 +1427,6 @@ Outputs:
     Value: !Ref CognitoM2MClient
   ToolFunctionName:
     Value: !Ref ToolFn
-  AgentTestFunctionName:
-    Description: Invoke with {} for the test suite, or {"prompt":"..."} for one question
-    Value: !Ref AgentTestFn
   KmsKeyArn:
     Description: Customer managed key used by this stack
     Value: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]

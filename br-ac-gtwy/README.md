@@ -39,7 +39,6 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and 
 | `agent/build_agent.ipynb` | Builds the arm64 agent zip in SageMaker AI, uploads it to S3, optionally updates the stack and tests the agent |
 | `scripts/deploy.sh` | Packages the agent for linux/arm64, uploads it to S3, deploys the stack, redeploys the API stage |
 | `scripts/invoke.py` | Calls the runtime with a prompt from your laptop |
-| `scripts/test-agent.sh` | Invokes the agent test Lambda and prints the results |
 | `scripts/test-api.sh` | Gets a Cognito token and curls the API (run from inside the VPC) |
 
 ## Prerequisites — what must already exist
@@ -55,7 +54,6 @@ Don't allow 443 from the stack's workload security group instead. That rule woul
 | `com.amazonaws.<region>.dynamodb` (gateway endpoint on the subnets' route tables) | API Lambda, deploy helper (seed) |
 | `com.amazonaws.<region>.bedrock-runtime` | Agent → model |
 | `com.amazonaws.<region>.bedrock-agentcore.gateway` | Agent → MCP gateway |
-| `com.amazonaws.<region>.bedrock-agentcore` (data plane) | Agent test Lambda → `InvokeAgentRuntime`. Only needed while `TestFunctionInVpc=true` (the default) |
 | `com.amazonaws.<region>.logs` | Agent runtime logging |
 
 Also needed:
@@ -81,7 +79,6 @@ export ARTIFACT_BUCKET=my-artifacts-bucket
 # export ENVIRONMENT=dev
 # export KMS_KEY_ARN=arn:aws:kms:...:key/...   # use an existing CMK (blank = stack creates one)
 # export CREATE_APIGW_ACCOUNT_ROLE=true        # only if the account has no API Gateway CloudWatch role
-# export TEST_FN_IN_VPC=false                  # only if the VPC has no bedrock-agentcore data-plane endpoint
 ./scripts/deploy.sh
 ```
 
@@ -106,48 +103,7 @@ The notebook's execution role needs `s3:PutObject` on the bucket. Steps 5–6 al
 
 ## Test
 
-### Agent test Lambda (recommended)
-
-The stack deploys `<project>-agent-test`, a Lambda that calls the agent through `InvokeAgentRuntime`, the same way a real client would, and checks the answers.
-
-```bash
-./scripts/test-agent.sh                              # built-in suite
-./scripts/test-agent.sh "Show me customer C-1003"    # one question
-```
-
-The script prints each question and answer with PASS/FAIL, and exits non-zero on any FAIL or ERROR, so you can use it in a pipeline.
-
-**Invoking it directly** from the Lambda console Test tab or the CLI:
-
-| Event | What it does |
-|---|---|
-| `{}` | Runs the built-in suite (4 checks against the seed data) |
-| `{"prompt": "..."}` | Asks one question; status `ANSWERED` |
-| `{"prompts": ["...", "..."]}` | Asks several questions |
-| add `"sessionId": "<33+ chars>"` | Reuses one runtime session for every prompt |
-
-```bash
-aws lambda invoke --function-name agentcore-poc-agent-test \
-  --cli-binary-format raw-in-base64-out --cli-read-timeout 620 \
-  --payload '{"prompt":"List active customers in Ontario"}' out.json && cat out.json
-```
-
-**The built-in suite:**
-
-| Check | Prompt | Passes if the answer contains |
-|---|---|---|
-| list with filter | active customers in Ontario | `C-1001` or `Alice` |
-| get by id | C-1002's accounts and total balance | `61,234` |
-| not found | customer C-9999 | "not found", "couldn't find", … |
-| create | onboard a new customer (unique email per run) | `PENDING_KYC` |
-
-The answers come from an LLM, so the checks look for key facts rather than exact wording. The **create** check writes a real `Test User` record to the table on every run.
-
-**Details:**
-- **Timeouts:** each question can take up to 280 seconds, and the Lambda itself up to 10 minutes. Questions that don't fit in the remaining time are reported as `SKIPPED`.
-- **No boto3 dependency:** it uses the boto3 `bedrock-agentcore` client when the Lambda runtime includes it. Otherwise it sends the same request signed with SigV4, so it doesn't depend on the runtime's boto3 version.
-- **Network:** with `TestFunctionInVpc=true` (the default) it runs in the VPC and needs the `bedrock-agentcore` data-plane endpoint. With `false` it runs outside the VPC, which the org hook reports as a warning.
-- **Permissions:** its role can only call `bedrock-agentcore:InvokeAgentRuntime` on this runtime.
+You can also use the **Test** tab ("playground") on the runtime in the AgentCore console with a payload like `{"prompt": "List active customers in Ontario"}`.
 
 ### From your laptop
 
@@ -224,13 +180,11 @@ Resources that can't take tags are skipped: custom resources, API methods and re
 | X-Ray tracing on the API stage | `TracingEnabled: true` | CKV_AWS_73 |
 | API Gateway access logging | JSON access logs to a CMK-encrypted log group, 90-day retention | CKV_AWS_76 |
 
-Checkov 3.x result for the template: **97 passed, 10 failed**. None of the failures are in the list above. They are:
+Checkov 3.x result for the template: **81 passed, 8 failed**. None of the failures are in the list above. They are:
 
 - Lambda dead-letter queues and reserved concurrency (CKV_AWS_116/115)
 - API caching (CKV_AWS_120)
 - `deploy-helper` not in a VPC (CKV_AWS_117, intentional)
-
-The DLQ and concurrency findings now count 4 Lambdas, including the agent test Lambda.
 
  Dead-letter queues only apply to async invocations, and these Lambdas are called synchronously.
 
@@ -279,6 +233,37 @@ DynamoDB's own backups don't need AWS Backup or a vault.
 - **On demand:** to take another native on-demand backup, bump `BackupVersion` on the `OnDemandBackup` resource and redeploy, or run `aws dynamodb create-backup` at any time.
 - **Retention:** the stack's on-demand backup is deleted with the stack. When you bump `BackupVersion`, the previous one is deleted. Backups you take by hand are yours to delete.
 
+## Agent logging and troubleshooting
+
+The agent logs to stdout. AgentCore ships those logs to `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT`, which the stack deletes on stack delete. A healthy start and invocation look like this:
+
+```
+INFO:customer_agent:Agent configured: model=us.anthropic... region=ca-central-1 gateway=https://...gateway.bedrock-agentcore...
+INFO:customer_agent:Received payload: {'prompt': 'List customers in Ontario'}
+INFO:customer_agent:Gateway tools: ['customer-tools___list_customers', 'customer-tools___get_customer', 'customer-tools___create_customer']
+INFO:customer_agent:Tools used: {'customer-tools___list_customers': 1}
+```
+
+**Payload:** the agent accepts `{"prompt": "..."}`, `{"input": "..."}`, `{"message": "..."}` or a plain string. It returns `result`, `tools_used` and `prompt_seen`.
+
+For Strands, MCP and HTTP internals, set `LOG_LEVEL=DEBUG` in the runtime's environment variables.
+
+**"Runtime initialization time exceeded. Please make sure that initialization completes in 30s"**
+
+AgentCore needs the agent's HTTP server to answer `/ping` within 30 seconds of starting. Locally, the agent answers in under 1 second with Python 3.12. Two details help:
+
+- **`app.run(host="0.0.0.0", port=8080)`:** with no host, `BedrockAgentCoreApp.run()` listens only on `127.0.0.1` unless it detects Docker. Setting it explicitly is harmless and rules that out.
+- **Nothing slow at import time:** no AWS API calls at startup. For example, listing Bedrock models or inference profiles needs the `bedrock` control-plane endpoint, which this VPC doesn't have, so the call would hang until the timeout.
+
+If it still times out, look at the first lines of the runtime log:
+
+| Log shows | Cause |
+|---|---|
+| no `Agent configured` line | The entry point wasn't found or crashed on import. The zip must have `customer_agent.py` at its root (`EntryPoint: [customer_agent.py]`), built for linux/arm64 + Python 3.12. Rebuild it |
+| `KeyError: 'GATEWAY_URL'` | The runtime has no `GATEWAY_URL` environment variable. Deploy through the stack, which sets it |
+| `ModuleNotFoundError` / `ImportError` | Dependencies weren't packaged for linux/arm64 + Python 3.12. Rebuild with the notebook or `deploy.sh` |
+| an error at `Gateway tools` (at invocation) | The `bedrock-agentcore.gateway` VPC endpoint, its security group (443 from `172.16.0.0/20`), or the runtime role's `InvokeGateway` permission |
+
 ## Design notes
 
 - **Cognito without a domain.** A user pool with a domain can't be reached through the cognito-idp VPC endpoint, and `/oauth2/token` isn't available over PrivateLink. So the pool has no domain, and the tool Lambda uses Cognito's `GetClientToken` API (client-credentials M2M), which goes through the cognito-idp endpoint.
@@ -319,4 +304,3 @@ Deletion takes a few minutes, mostly waiting for Lambda VPC network interfaces t
 - **Your VPC, subnets, VPC endpoints and the artifact S3 bucket.** The agent zips that `deploy.sh` uploaded under `agentcore-poc/` stay in the bucket. Delete them with `aws s3 rm s3://<bucket>/agentcore-poc/ --recursive`.
 - **Recovery points made by your organisation's backup policy** (from the `dynamodbbackup` tag). Those live in the org's vault under its retention rules.
 - **The account-level API Gateway CloudWatch setting:** if you deployed with `CREATE_APIGW_ACCOUNT_ROLE=true`, deleting the stack deletes that role. The account setting keeps pointing at it, so other APIs' logging in that account and region stops until it's set again.
-- **Test customers** written by the agent test Lambda go away with the table.

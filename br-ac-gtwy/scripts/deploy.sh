@@ -20,7 +20,6 @@ SUPPORT_TEAM="${SUPPORT_TEAM:-CLOUD}"
 SERVICE_NAME="${SERVICE_NAME:-AgentCore POC}"
 ENVIRONMENT="${ENVIRONMENT:-dev}"
 KMS_KEY_ARN="${KMS_KEY_ARN:-}"           # blank = stack creates its own CMK
-TEST_FN_IN_VPC="${TEST_FN_IN_VPC:-true}"   # false if the VPC has no bedrock-agentcore data-plane endpoint
 CREATE_APIGW_ACCOUNT_ROLE="${CREATE_APIGW_ACCOUNT_ROLE:-false}"  # true only if the account has no API GW CloudWatch role
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,6 +41,11 @@ rm -rf "$BUILD" && mkdir -p "$BUILD/pkg"
 pip install -q -r "$ROOT/agent/requirements.txt" --target "$BUILD/pkg" \
   --platform manylinux2014_aarch64 --python-version 3.12 --implementation cp --only-binary=:all:
 cp "$ROOT/agent/customer_agent.py" "$BUILD/pkg/"
+# pip compiled bytecode for the local Python; the runtime can't use it. Precompile for 3.12 if available.
+find "$BUILD/pkg" -name __pycache__ -prune -exec rm -rf {} +
+if command -v python3.12 >/dev/null; then
+  python3.12 -m compileall -q -j0 --invalidation-mode unchecked-hash "$BUILD/pkg" >/dev/null && echo "    precompiled bytecode for Python 3.12"
+fi
 (cd "$BUILD/pkg" && zip -qr "$BUILD/agent.zip" .)
 aws s3 cp --region "$REGION" "$BUILD/agent.zip" "s3://$ARTIFACT_BUCKET/$CODE_KEY"
 
@@ -52,7 +56,7 @@ aws cloudformation deploy --region "$REGION" \
     VpcId="$VPC_ID" PrivateSubnetIds="$SUBNET_IDS" ExecuteApiVpceId="$EXECUTE_API_VPCE" \
     AppCatID="$APP_CAT_ID" SupportTeam="$SUPPORT_TEAM" ServiceName="$SERVICE_NAME" Environment="$ENVIRONMENT" \
     ExistingKmsKeyArn="$KMS_KEY_ARN" \
-    CreateApiGatewayAccountRole="$CREATE_APIGW_ACCOUNT_ROLE" TestFunctionInVpc="$TEST_FN_IN_VPC" \
+    CreateApiGatewayAccountRole="$CREATE_APIGW_ACCOUNT_ROLE" \
     ArtifactBucket="$ARTIFACT_BUCKET" AgentCodeKey="$CODE_KEY" ModelId="$MODEL_ID" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
 

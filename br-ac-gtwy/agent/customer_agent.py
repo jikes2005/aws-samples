@@ -1,9 +1,3 @@
-"""Strands agent hosted on AgentCore Runtime.
-
-Tools are discovered at request time from AgentCore Gateway (MCP over
-streamable HTTP). The gateway uses AWS_IAM inbound auth, so every MCP request
-is SigV4-signed with the runtime role's credentials.
-"""
 import logging
 import os
 
@@ -11,64 +5,77 @@ import boto3
 import httpx
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore import BedrockAgentCoreApp
 from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("customer-agent")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+log = logging.getLogger("customer_agent")
 
-GATEWAY_URL = os.environ["GATEWAY_URL"]
+# Settings come from the runtime's environment variables (set by the CloudFormation stack)
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 REGION = os.environ.get("AWS_REGION_NAME") or os.environ.get("AWS_REGION", "ca-central-1")
+GATEWAY_URL = os.environ["GATEWAY_URL"]
 
-SYSTEM_PROMPT = """You are a customer-service assistant for a Canadian bank (demo data only).
-Use the customer tools to look up, list, or create customers. Never invent customer
-data - if a tool returns an error, 404 or 409 (duplicate email), say so plainly.
-Before creating a customer, confirm you have first name, last name and email.
-Keep answers short and factual."""
-
-session = boto3.Session(region_name=REGION)
 app = BedrockAgentCoreApp()
+session = boto3.Session(region_name=REGION)
 
 
-class SigV4HttpxAuth(httpx.Auth):
-    """Signs each outgoing httpx request for the bedrock-agentcore service."""
+class GatewayAuth(httpx.Auth):
+    """Signs MCP requests with the runtime role (the gateway uses AWS_IAM auth)."""
 
     requires_request_body = True
 
-    def __init__(self, service: str = "bedrock-agentcore"):
-        self.service = service
-
-    def auth_flow(self, request: httpx.Request):
-        creds = session.get_credentials().get_frozen_credentials()
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in ("connection", "accept-encoding")}
-        aws_req = AWSRequest(method=request.method, url=str(request.url), data=request.content, headers=headers)
-        SigV4Auth(creds, self.service, REGION).add_auth(aws_req)
-        request.headers.update(dict(aws_req.headers))
+    def auth_flow(self, request):
+        aws_request = AWSRequest(method=request.method, url=str(request.url), data=request.content,
+                                 headers={"Content-Type": request.headers.get("Content-Type", "")})
+        SigV4Auth(session.get_credentials(), "bedrock-agentcore", REGION).add_auth(aws_request)
+        request.headers.update(dict(aws_request.headers))
         yield request
 
 
-def _mcp_client() -> MCPClient:
-    return MCPClient(lambda: streamablehttp_client(GATEWAY_URL, auth=SigV4HttpxAuth()))
+model = BedrockModel(
+    model_id=MODEL_ID,
+    region_name=REGION,
+    temperature=0.2,     # lower = more consistent, better for tool use
+    max_tokens=2048,
+)
 
+SYSTEM_PROMPT = (
+    "You are a customer-service assistant for a Canadian bank (demo data only). "
+    "Use the customer tools to look up, list or create customers, and base your answer on the tool results. "
+    "If a tool fails or returns 404 or 409 (duplicate email), say so rather than guessing. "
+    "Before creating a customer, make sure you have first name, last name and email."
+)
 
-model = BedrockModel(model_id=MODEL_ID, region_name=REGION, temperature=0.2)
+log.info("Agent configured: model=%s region=%s gateway=%s", MODEL_ID, REGION, GATEWAY_URL)
 
 
 @app.entrypoint
-def invoke(payload: dict) -> dict:
-    prompt = payload.get("prompt") or "List all active customers."
-    log.info("prompt=%s", prompt)
-    with _mcp_client() as mcp:
-        tools = mcp.list_tools_sync()
-        log.info("tools=%s", [t.tool_name for t in tools])
-        agent = Agent(model=model, tools=tools, system_prompt=SYSTEM_PROMPT)
+def invoke(payload):
+    log.info("Received payload: %s", payload)
+
+    if isinstance(payload, str):
+        prompt = payload
+    else:
+        prompt = (payload.get("prompt") or payload.get("input")
+                  or payload.get("message") or "Hello!")
+
+    # Tools come from AgentCore Gateway (MCP). Open a connection for this request.
+    with MCPClient(lambda: streamablehttp_client(GATEWAY_URL, auth=GatewayAuth())) as gateway:
+        tools = gateway.list_tools_sync()
+        log.info("Gateway tools: %s", [t.tool_name for t in tools])
+
+        agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, tools=tools, callback_handler=None)
         result = agent(prompt)
-    return {"result": str(result)}
+
+    tools_used = {name: m.call_count for name, m in result.metrics.tool_metrics.items()}
+    log.info("Tools used: %s", tools_used)
+
+    return {"result": str(result), "tools_used": tools_used, "prompt_seen": prompt}
 
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=8080)   # listen on all interfaces so the runtime's health check can reach it
