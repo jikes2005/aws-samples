@@ -1,0 +1,383 @@
+# AgentCore POC
+
+Strands agent on **Bedrock AgentCore Runtime** → **AgentCore Gateway** (MCP) → **Lambda** tool → **private API Gateway** (IAM auth) → Lambda → **DynamoDB**, with **AgentCore Memory** for short-term (conversation) and long-term (per-user) memory.
+
+Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and runs in an existing VPC using existing subnets and VPC endpoints. Nothing is internet-facing.
+
+```
+ invoke_agent_runtime
+        │
+┌───────▼────────────── existing VPC (private subnets) ──────────────────────────────┐
+│ AgentCore Runtime (VPC mode)                                                       │
+│   Strands agent ──SigV4 MCP──► AgentCore Gateway (MCP, AWS_IAM inbound auth)        │
+│        │                              │ GATEWAY_IAM_ROLE                            │
+│        ├──► Bedrock (model)           ▼                                             │
+│        └──► AgentCore Memory    Lambda: customer-tools                              │
+│             (short + long term)       │  SigV4-signed with its role                 │
+│                                       │  (execute-api:Invoke)                       │
+│                              ┌────────┘                                             │
+│                              ▼                                                      │
+│              Private REST API, AWS_IAM authorization                                │
+│                GET  /customers                                                      │
+│                GET  /customers/{customerId}                                         │
+│                POST /customers                                                      │
+│                              │ AWS_PROXY                                            │
+│                              ▼                                                      │
+│              Lambda: customer-api ──► DynamoDB  <project>-customers                 │
+│                                                                                     │
+│  (Deploy time only, OUTSIDE the VPC: Lambda deploy-helper - custom resources)      │
+│     Custom::SeedCustomers    → loads 4 sample customers                             │
+│     + on-demand backup and delete-time cleanup                                      │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `cfn/agentcore-poc.yaml` | The whole POC: CMK, workload SG, DynamoDB (PITR + on-demand backup), seed custom resource, private REST API (IAM auth), API Lambda, tool Lambda, AgentCore Gateway + target, AgentCore Memory, AgentCore Runtime |
+| `agent/customer_agent.py` | Strands agent; loads tools from the gateway over MCP with SigV4 auth, and uses AgentCore Memory through the Strands session manager |
+| `agent/requirements.txt` | Agent dependencies. The agent works with `mcp` 1.x and 2.x |
+| `agent/build_agent.ipynb` | Builds the arm64 agent zip in SageMaker AI, uploads it to S3, optionally updates the stack and tests the agent |
+| `scripts/deploy.sh` | Packages the agent for linux/arm64, uploads it to S3, deploys the stack, redeploys the API stage |
+| `scripts/invoke.py` | Calls the runtime with a prompt from your laptop (`ACTOR_ID` / `SESSION_ID` for memory) |
+| `scripts/test-api.sh` | Curls the API with SigV4-signed requests (run from inside the VPC) |
+
+## Prerequisites — what must already exist
+
+**VPC endpoints** (interface endpoints with private DNS unless noted). Their security groups must allow inbound 443 **from the VPC's address range**. For this VPC that's one rule for `172.16.0.0/20`, which covers all four of its CIDR blocks (`172.16.0.0/21`, `172.16.8.0/22`, `172.16.12.0/23`, `172.16.14.0/24`).
+
+Don't allow 443 from the stack's workload security group instead. That rule would make the shared endpoint security groups depend on this stack, and the stack delete would fail with *"WorkloadSecurityGroup has a dependent object"* until the rule is removed. Access to the endpoints is still controlled by IAM and endpoint policies.
+
+| Endpoint | Used by |
+|---|---|
+| `com.amazonaws.<region>.execute-api` | Tool Lambda → private API (its ID is a stack parameter) |
+| `com.amazonaws.<region>.dynamodb` (gateway endpoint on the subnets' route tables) | API Lambda, deploy helper (seed) |
+| `com.amazonaws.<region>.bedrock-runtime` | Agent → model |
+| `com.amazonaws.<region>.bedrock-agentcore.gateway` | Agent → MCP gateway |
+| `com.amazonaws.<region>.bedrock-agentcore` | Agent → AgentCore Memory (data plane: events and memory records) |
+| `com.amazonaws.<region>.logs` | Agent runtime logging |
+
+Also needed:
+- AWS CLI v2, Python 3.12 + pip, `zip`
+- A region where AgentCore Runtime and Gateway are available. This POC targets **ca-central-1**.
+- **Model:** the default `MODEL_ID` is a `us.` cross-region inference profile. It works from ca-central-1, but requests are processed in US regions (us-east-1, us-east-2, us-west-2 or ca-central-1). `global.` profiles may route worldwide. Check this against your data-residency requirements.
+- Bedrock model access for `MODEL_ID` (default is a Claude Sonnet inference profile; swap for one your account has enabled)
+- An existing S3 bucket for the agent zip
+- Private subnets in 2+ AZs that AgentCore Runtime supports (if runtime creation fails with a subnet/AZ error, pick subnets in other AZs)
+
+## Deploy
+
+```bash
+export AWS_REGION=ca-central-1
+export VPC_ID=vpc-xxxxxxxx
+export SUBNET_IDS=subnet-aaaa,subnet-bbbb
+export EXECUTE_API_VPCE=vpce-xxxxxxxx
+export ARTIFACT_BUCKET=my-artifacts-bucket
+# Tag values (defaults shown):
+# export APP_CAT_ID=12345
+# export SERVICE_NAME="AgentCore POC"
+# export SUPPORT_TEAM=CLOUD
+# export ENVIRONMENT=dev
+# export KMS_KEY_ARN=arn:aws:kms:...:key/...   # use an existing CMK (blank = stack creates one)
+# export CREATE_APIGW_ACCOUNT_ROLE=true        # only if the account has no API Gateway CloudWatch role
+./scripts/deploy.sh
+```
+
+The stack name is `agentcore-poc` (override with `PROJECT`). Re-running uploads a new agent zip under a new key, which updates the runtime, and redeploys the API stage.
+
+You can also deploy the template from the console or a pipeline. Upload the agent zip first and pass its key as `AgentCodeKey`.
+
+### Build the agent in SageMaker AI (alternative to `deploy.sh` packaging)
+
+Upload the `agent/` folder to a SageMaker AI notebook instance or Studio JupyterLab space, open `build_agent.ipynb` from inside that folder, and run all cells.
+
+1. **Configure:** set `PROJECT` and `ARTIFACT_BUCKET` (blank uses the SageMaker default bucket).
+2. **Install:** installs dependencies for linux/arm64, Python 3.12, using arm64 wheels only. The SageMaker instance is usually x86_64, so nothing is compiled locally.
+3. **Check:** syntax-checks `customer_agent.py`, then confirms every native extension is an aarch64 build.
+4. **Zip and upload:** writes `agent.zip` with `customer_agent.py` at the root and uploads it under a new versioned key. It prints the key to use as `AgentCodeKey`.
+5. **Update stack** (`DEPLOY_STACK = True`): updates the existing stack, changing only `ArtifactBucket` and `AgentCodeKey`. Every other parameter keeps its previous value.
+6. **Test** (`RUN_TEST = True`): invokes the agent twice in one session (short-term memory). You can also call `ask("...", session_id, actor_id)` from any cell.
+7. **Long-term memory:** lists the facts and preferences extracted for the test user, then asks in a new session to show they're recalled.
+
+For the very first deploy, either run `deploy.sh` or deploy the template from the console using the key printed in step 4.
+
+The notebook's execution role needs `s3:PutObject` on the bucket. Steps 5–6 also need `cloudformation:DescribeStacks` and `UpdateStack`, `iam:PassRole` on the stack's roles, and `bedrock-agentcore:InvokeAgentRuntime`.
+
+## Test
+
+You can also use the **Test** tab ("playground") on the runtime in the AgentCore console with a payload like `{"prompt": "List active customers in Ontario", "actor_id": "demo-user"}`.
+
+### From your laptop
+
+**Agent end to end:**
+
+```bash
+python scripts/invoke.py "List active customers in Ontario"
+python scripts/invoke.py "What accounts does C-1002 have and what's the total balance?"
+python scripts/invoke.py "Onboard Dana Lee, dana.lee@example.com, Ottawa ON"
+python scripts/invoke.py "Onboard Dana Lee again with dana.lee@example.com"   # expect duplicate-email 409
+```
+
+New customers persist in DynamoDB, so a follow-up "show me Dana Lee's record" works.
+
+**Memory:**
+
+```bash
+# Short-term: reuse the session ID the first call prints
+python scripts/invoke.py "I look after Ontario customers. List the active ones as a short table."
+SESSION_ID=<session from above> python scripts/invoke.py "Which of those are WEALTH customers?"
+
+# Long-term: wait a minute or two for extraction, then start a NEW session as the same actor
+python scripts/invoke.py "Show me my customers"     # recalls Ontario + table format
+ACTOR_ID=someone-else python scripts/invoke.py "Show me my customers"   # no memories for this actor
+
+# See what was extracted
+MEM=$(aws cloudformation describe-stacks --stack-name agentcore-poc \
+  --query "Stacks[0].Outputs[?OutputKey=='MemoryId'].OutputValue" --output text)
+aws bedrock-agentcore list-memory-records --memory-id $MEM --namespace /preferences/demo-user/
+aws bedrock-agentcore list-memory-records --memory-id $MEM --namespace /facts/demo-user/
+```
+
+**Tool Lambda directly** (simulates the gateway's client context):
+
+```bash
+CTX=$(printf '{"custom":{"bedrockAgentCoreToolName":"customer-tools___get_customer"}}' | base64 -w0)
+aws lambda invoke --function-name agentcore-poc-customer-tools \
+  --client-context "$CTX" --cli-binary-format raw-in-base64-out \
+  --payload file://events/tool-get-customer.json out.json && cat out.json
+```
+
+**API directly** (from an instance in the VPC): `./scripts/test-api.sh` checks that an unsigned request gets 403, then runs signed GETs and a POST. Your credentials need `execute-api:Invoke` on the API.
+
+## AgentCore Memory
+
+One `AWS::BedrockAgentCore::Memory` resource (`AgentMemory`), encrypted with the stack's CMK and deleted with the stack.
+
+| | Short-term memory | Long-term memory |
+|---|---|---|
+| What's stored | Every message of the conversation, as raw events | Records extracted from those events by three built-in strategies |
+| Scope | `actorId` + `sessionId` | `actorId` (all of that user's sessions) |
+| How the agent uses it | The Strands session manager replays the session's earlier messages when the agent is created, and saves each new message as it's added | Before each prompt, the session manager searches `/facts/{actorId}/` and `/preferences/{actorId}/` and prepends the hits to the prompt in a `<user_context>` block |
+| Kept for | `MemoryEventExpiryDays` (default 30, range 3–365) | Until deleted |
+
+**Strategies:**
+
+| Strategy | Namespace | Extracts |
+|---|---|---|
+| `CustomerFacts` (semantic) | `/facts/{actorId}/` | Facts from the conversation, e.g. which customers the user works with |
+| `UserPreferences` | `/preferences/{actorId}/` | How the user likes answers, e.g. tables, a province or segment of interest |
+| `SessionSummaries` | `/summaries/{actorId}/{sessionId}/` | A running summary of each session (stored for inspection, not searched by the agent) |
+
+Extraction runs in the background, so a new fact or preference becomes searchable a minute or so after the conversation, not in the same turn.
+
+**IDs:**
+
+- `sessionId` is the runtime session ID (`runtimeSessionId` on `invoke_agent_runtime`). Calls that reuse it continue the conversation.
+- `actorId` comes from `actor_id` (or `user_id`) in the payload, default `default-user`. Characters other than letters, digits, `-` and `_` become `-`, so `jane@example.com` is stored as `jane-example-com`.
+- In this POC the caller chooses the actor ID. In a real app, take it from the authenticated identity, otherwise one user could read another's memories by sending their ID.
+
+**Permissions:** the runtime role gets the event and memory-record actions on this memory only (`CreateEvent`, `GetEvent`, `ListEvents`, `DeleteEvent`, `ListSessions`, `RetrieveMemoryRecords`, `ListMemoryRecords`, `GetMemoryRecord`), plus `Decrypt`, `GenerateDataKey` and `DescribeKey` on the CMK. Built-in strategies need no memory execution role.
+
+**Changing namespaces:** they're defined twice, in the template's `MemoryStrategies` and in `MEMORY_NAMESPACES` in `customer_agent.py`. Keep them in step.
+
+## Why the deploy helper runs outside the VPC
+
+Every Lambda that serves traffic (API backend, MCP tool) runs in the VPC. The one exception is `deploy-helper`, which only runs while CloudFormation creates, updates or deletes the stack. This is the same pattern as the RAG POC's schema-init Lambda.
+
+- **Why it can't run in the VPC:** after each custom-resource action it must `PUT` its result to a pre-signed URL in an AWS-owned S3 bucket (`cloudformation-custom-resource-response-<region>`). The private subnets can't resolve that hostname. In the VPC this failed with `URLError: [Errno 16] Device or resource busy`, Lambda's form of a DNS failure. CloudFormation then waited and rolled back.
+- **What it calls:** only AWS APIs (DynamoDB and CloudWatch Logs) and the response URL. Nothing in the VPC.
+- **How it answers CloudFormation:** it retries the response up to 5 times. A timer also sends `FAILED` 20 seconds before the Lambda times out, so a hung call can't leave the stack waiting.
+- **Effect on the org hook:** it flags this as a **warning** (Lam.23), not an error, so it doesn't block the deploy. Checkov reports the same as CKV_AWS_117.
+
+To move it into the VPC later, the subnets need DNS resolution and a route to `*.s3.<region>.amazonaws.com`, and an S3 endpoint policy that allows `s3:PutObject` on the response bucket. Then add `VpcConfig` back to `DeployHelperFn` and `AWSLambdaVPCAccessExecutionRole` to its role.
+
+## Custom resources
+
+The `deploy-helper` Lambda backs four custom resources:
+
+- **`Custom::SeedCustomers`:** loads 4 sample customers on create. It uses conditional puts, so it never overwrites records. Bump `SeedVersion` to re-run it. Nothing happens on delete, because the table goes with the stack.
+- **`Custom::DynamoDbOnDemandBackup`:** takes a native on-demand backup, and deletes it with the stack.
+- **`Custom::TableDeletionGuard`:** lifts the table's deletion protection right before stack delete.
+- **`Custom::RuntimeLogCleanup`:** deletes the runtime's service-created log group after the runtime is gone.
+
+A `Delete` for a resource type the helper no longer manages, such as the removed `Custom::CognitoM2MClient`, succeeds as a no-op. So a stack deployed with the earlier Cognito version updates cleanly.
+
+**If a custom resource can't reach CloudFormation**, the helper logs each failed send. If all 5 fail, the stack waits up to `ServiceTimeout` (5 minutes) and then fails.
+
+## Organisation policy hook (CCF::PAC::LambdaHook)
+
+The account runs a CloudFormation hook that scans **the template itself**, before parameters are resolved. Write any value the hook checks as a literal, never as `!Ref` or `!If`.
+
+| Hook finding | Fix in the template |
+|---|---|
+| API.31 – stage tagged `ApplyCommonWaf` | Literal `"true"` tag on `ApiStage`. It must be a literal: the hook rejects `!Ref`. To opt out of the common WAF, edit the value to `"false"` |
+| DDB.14 – deletion protection | `DeletionProtectionEnabled: true` on the table. `TableDeletionGuard` lifts it only when the stack is deleted |
+| Lam.23 – Lambda in a VPC (warning) | The API and tool Lambdas run in the VPC. `deploy-helper` intentionally doesn't (see *Why the deploy helper runs outside the VPC*), so this stays a non-blocking warning for that one function |
+| Required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (20). `Description` is per resource. The others come from parameters |
+| DDB.11 – on-demand backup | Literal tag `dynamodbbackup: "True"` on the table. The hook checks the tag, which enrols the table in the organisation's backup policy (confirm with your platform team) |
+
+Resources that can't take tags are skipped: custom resources, API methods and resources, the authorizer, deployment, Lambda permission, KMS alias and gateway target.
+
+
+| Requirement | How it's met | Scanner check (Checkov) |
+|---|---|---|
+| Customer managed KMS key everywhere it's supported | One CMK (rotation on), or bring your own via `ExistingKmsKeyArn`. See coverage below | CKV_AWS_119, 158, 173, 7 |
+| DynamoDB encrypted with the CMK | `SSEType: KMS` + `KMSMasterKeyId` | CKV_AWS_119 |
+| On-demand backup configured | `dynamodbbackup: "True"` tag (org backup policy), PITR, and a native DynamoDB on-demand backup taken at deploy (`Custom::DynamoDbOnDemandBackup`). The stack has no AWS Backup vault or plan of its own | CKV_AWS_28 |
+| API stage tagged `ApplyCommonWaf` | Literal `"true"` on the stage's tags. It's not a parameter, because the org hook needs a literal `true`/`false`. Edit the value to `"false"` to opt the stage out of the common WAF | API.31 |
+| X-Ray tracing on the API stage | `TracingEnabled: true` | CKV_AWS_73 |
+| API Gateway access logging | JSON access logs to a CMK-encrypted log group, 90-day retention | CKV_AWS_76 |
+
+Checkov 3.x result for the template: **81 passed, 8 failed**. None of the failures are in the list above. They are:
+
+- Lambda dead-letter queues and reserved concurrency (CKV_AWS_116/115)
+- API caching (CKV_AWS_120)
+- `deploy-helper` not in a VPC (CKV_AWS_117, intentional)
+
+ Dead-letter queues only apply to async invocations, and these Lambdas are called synchronously.
+
+**About "API Gateway V2" access logging:** this stack has no API Gateway V2 (HTTP/WebSocket) API. The customer API is a REST API (v1), because only REST APIs support the `PRIVATE` endpoint type. Access logging is enabled on that REST stage, which satisfies the v1 rule (CKV_AWS_76). The V2 rule (CKV_AWS_95) only applies to `AWS::ApiGatewayV2::Stage`, so it has nothing to evaluate here.
+
+### CMK coverage
+
+| Resource | Encryption |
+|---|---|
+| DynamoDB table | CMK |
+| DynamoDB on-demand backups | CMK (inherits the table's key) |
+| CloudWatch log groups (3 Lambdas + API access logs) | CMK |
+| Lambda environment variables (3 functions) | CMK |
+| AgentCore Gateway | CMK |
+| AgentCore Memory (events and extracted records) | CMK |
+| AgentCore Runtime (serverless) | AWS-owned key. No CMK option for the serverless compute type |
+| AgentCore Runtime log group | Created by the service at first run, so it has the default encryption. Add a CMK afterwards with `aws logs associate-kms-key` if needed |
+| API Gateway | No data at rest (no cache configured) |
+| Agent zip in S3 | Your existing bucket's encryption settings |
+
+The key policy has two statements:
+
+- **Account root:** enables IAM policies on the key.
+- **CloudWatch Logs:** scoped to this account's log groups.
+
+Every role gets key use through its own IAM policy on this one key:
+
+- **Gateway service role** (`GatewayKmsPolicy`): `DescribeKey`, `Decrypt`, `GenerateDataKey`, `CreateGrant`. This is required at gateway creation. A key-policy grant with `kms:ViaService` and encryption-context conditions was rejected with "no identity-based policy allows kms:GenerateDataKey".
+- **The two roles that access the table:** through `dynamodb.<region>.amazonaws.com` only.
+- **The three Lambda roles:** `Decrypt`, for their environment variables.
+- **Runtime role:** `Decrypt`, `GenerateDataKey`, `DescribeKey`, for reading and writing AgentCore Memory. CloudFormation creates the memory with the deploying identity's permissions, which must include `kms:CreateGrant` and `kms:DescribeKey` on the key (an admin deploy role normally has them).
+
+There's no wildcard principal. None of these calls go from the VPC to KMS, so you don't need a KMS endpoint.
+
+**Using an existing CMK (`ExistingKmsKeyArn`):** its key policy must enable IAM policies (the standard account-root statement) and allow CloudWatch Logs for this account's log groups. The stack's IAM policies cover everything else.
+
+### Access-logging prerequisite
+
+API Gateway access logging needs a CloudWatch Logs role set at the **account level** for each region. `deploy.sh` checks this first and stops if none is set. If your account doesn't have one, set `CREATE_APIGW_ACCOUNT_ROLE=true` and the stack creates it. That overwrites the account-wide setting, so in a shared account check with your platform team first.
+
+### Backups
+
+DynamoDB's own backups don't need AWS Backup or a vault.
+
+- **Scheduled:** handled by your organisation's AWS Backup policy, via the `dynamodbbackup: "True"` tag. Those recovery points live in the org's vault, not in this stack.
+- **Continuous:** PITR lets you restore to any second in the last 35 days.
+- **On demand:** to take another native on-demand backup, bump `BackupVersion` on the `OnDemandBackup` resource and redeploy, or run `aws dynamodb create-backup` at any time.
+- **Retention:** the stack's on-demand backup is deleted with the stack. When you bump `BackupVersion`, the previous one is deleted. Backups you take by hand are yours to delete.
+
+## Agent logging and troubleshooting
+
+The agent logs to stdout. AgentCore ships those logs to `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT`, which the stack deletes on stack delete. A healthy start and invocation look like this:
+
+```
+INFO:customer_agent:Agent configured: model=us.anthropic... region=ca-central-1 gateway=https://...gateway.bedrock-agentcore...
+INFO:customer_agent:Received payload: {'prompt': 'List customers in Ontario', 'actor_id': 'demo-user'}
+INFO:customer_agent:Memory: actor=demo-user session=3f2c...-poc
+INFO:customer_agent:Gateway tools: ['customer-tools___list_customers', 'customer-tools___get_customer', 'customer-tools___create_customer']
+INFO:customer_agent:Short-term memory: 2 earlier message(s) restored
+INFO:customer_agent:Long-term memory used: <user_context>Prefers answers as a short table ...</user_context>
+INFO:customer_agent:MCP call: customer-tools___list_customers input={'province': 'ON'}
+INFO:customer_agent:MCP result (success): {...}
+INFO:customer_agent:Tools used: {'customer-tools___list_customers': 1}
+```
+
+**Payload:** the agent accepts `{"prompt": "..."}`, `{"input": "..."}`, `{"message": "..."}` or a plain string. Add `actor_id` to scope memory to a user. It returns `result`, `tools_used`, `prompt_seen`, `actor_id`, `session_id` and `messages_restored`.
+
+For Strands, MCP and HTTP internals, set `LOG_LEVEL=DEBUG` in the runtime's environment variables.
+
+**"Runtime initialization time exceeded. Please make sure that initialization completes in 30s"**
+
+AgentCore needs the agent's HTTP server to answer `/ping` within 30 seconds of starting. Locally, the agent answers in under 1 second with Python 3.12. Two details help:
+
+- **`app.run(host="0.0.0.0", port=8080)`:** with no host, `BedrockAgentCoreApp.run()` listens only on `127.0.0.1` unless it detects Docker. Setting it explicitly is harmless and rules that out.
+- **Nothing slow at import time:** no AWS API calls at startup. For example, listing Bedrock models or inference profiles needs the `bedrock` control-plane endpoint, which this VPC doesn't have, so the call would hang until the timeout.
+
+If it still times out, look at the first lines of the runtime log:
+
+| Log shows | Cause |
+|---|---|
+| no `Agent configured` line | The entry point wasn't found or crashed on import. The zip must have `customer_agent.py` at its root (`EntryPoint: [customer_agent.py]`), built for linux/arm64 + Python 3.12. Rebuild it |
+| `KeyError: 'GATEWAY_URL'` | The runtime has no `GATEWAY_URL` environment variable. Deploy through the stack, which sets it |
+| `ModuleNotFoundError` / `ImportError` | Dependencies weren't packaged for linux/arm64 + Python 3.12. Rebuild with the notebook or `deploy.sh` |
+| `KeyError: 'MEMORY_ID'` | Same as above: deploy through the stack, which sets `MEMORY_ID` |
+| errors from `bedrock_agentcore.memory` (at invocation), or a hang after `Memory:` | The `bedrock-agentcore` VPC endpoint (443 from `172.16.0.0/20`), the runtime role's `Memory`/`MemoryCmk` permissions, or `AccessDeniedException` on KMS |
+| an error at `Gateway tools` (at invocation) | The `bedrock-agentcore.gateway` VPC endpoint, its security group (443 from `172.16.0.0/20`), or the runtime role's `InvokeGateway` permission |
+
+## Troubleshooting the customer API (403 / 5xx)
+
+The tool Lambda's log (`/aws/lambda/<project>-customer-tools`) shows each call's status and API Gateway request ID. To find out **why** API Gateway rejected a request, use two log groups the stack creates:
+
+| Log group | What it shows |
+|---|---|
+| `/aws/apigateway/<project>-customer-api/access` | One line per request: `status`, `caller`, `vpceId`, `errorMessage`, `authError`, `wafResponseCode`, `webAclArn` |
+| `API-Gateway-Execution-Logs_<api-id>/<stage>` | API Gateway's decision trail: IAM/resource-policy evaluation, authorizer, integration. Search it for the request ID |
+
+Common causes of `403 {"message":"Forbidden"}` on this private API:
+- **WAF:** the stage is tagged `ApplyCommonWaf: "true"`, so the org's common web ACL may be attached and blocking. Check with `aws apigateway get-stage --rest-api-id <id> --stage-name dev --query webAclArn`. `wafResponseCode` in the access log confirms it.
+- **The stage serves an old deployment:** API Gateway only applies method, auth and resource-policy changes in a new deployment. The template forces one through the deployment resource's logical ID (`ApiDeploymentV2`); bump it whenever you change those. `deploy.sh` also redeploys the stage on every run.
+- **A request that didn't come through `ExecuteApiVpceId`,** or a caller without `execute-api:Invoke`. The execution log names the denying statement.
+
+## Design notes
+
+- **IAM auth on the API (no Cognito).** All three methods use `AWS_IAM` authorization. The tool Lambda SigV4-signs each request for `execute-api` with its own role's credentials.
+  - Its role is allowed `execute-api:Invoke` on this API only.
+  - The API's resource policy allows IAM principals in this account. A caller also needs `execute-api:Invoke` in its own IAM policy.
+  - The API Lambda logs the caller's role ARN and VPC endpoint ID, and the access log records `caller` and `callerAccount`.
+  - The only network dependency is the `execute-api` VPC endpoint.
+  - **The tool Lambda calls the API-specific hostname** `{api-id}-{vpce-id}.execute-api.{region}.amazonaws.com`, the `CustomerApiBaseUrl` output.
+    - That name exists because the API is associated with the endpoint (`ExecuteApiVpceId`), and it always routes to this API.
+    - It works even when the `execute-api` endpoint is shared from a networking account with private DNS disabled.
+    - In that setup, calling the plain `{api-id}.execute-api...` name through a central DNS zone can return `403 {"message":"Forbidden"}`.
+  - Earlier versions used a Cognito M2M token, which needed a `cognito-idp` VPC endpoint the VPC didn't have.
+- **Private API** keeps the resource policy that denies anything not arriving through your execute-api endpoint, so a request needs both the right network path and a valid signature.
+- **Gateway auth:** inbound `AWS_IAM` (only the runtime role can invoke it; the agent SigV4-signs MCP calls), outbound `GATEWAY_IAM_ROLE` (the gateway role can invoke only the tool Lambda).
+- **DynamoDB:** on-demand, PITR and encryption on.
+  - `list_customers` uses a Scan with filters, which is fine at POC size. Add GSIs for real access patterns.
+  - POST rejects duplicate emails via the `email-index` GSI and uses a conditional put on `customerId`.
+  - The table is deleted with the stack (see *Cleanup*). For real data, switch to `DeletionPolicy: Retain` and remove `TableDeletionGuard`.
+- **Tool input is whitelisted.** The tool Lambda forwards only known fields to POST.
+- `ExceptionLevel: DEBUG` on the gateway returns detailed tool errors to the agent. Useful for a POC; remove it later.
+
+## Cleanup
+
+```bash
+aws cloudformation delete-stack --stack-name agentcore-poc
+aws cloudformation wait stack-delete-complete --stack-name agentcore-poc
+```
+
+Deleting the stack removes everything it created. No resources have `DeletionPolicy: Retain`. A few things CloudFormation can't remove by itself are handled by the deploy helper during the delete:
+
+| Item | How it's removed |
+|---|---|
+| DynamoDB table (deletion protection on) | `TableDeletionGuard` is deleted first. It turns deletion protection off and waits for the table to be `ACTIVE`, then CloudFormation deletes the table |
+| On-demand backup | `OnDemandBackup` deletes its backup |
+| AgentCore Runtime log group (`/aws/bedrock-agentcore/runtimes/<name>-*`, created by the service) | `RuntimeLogCleanup` deletes it after the runtime is gone. The runtime takes its name from this resource, so CloudFormation deletes the runtime first |
+| Lambda, API access and helper log groups | Owned by the stack, deleted normally |
+| AgentCore Memory (all events and long-term records) | Deleted with the stack |
+| KMS key and alias | Deleted with the stack. KMS doesn't delete keys immediately: the key enters **Pending deletion for 7 days** (the minimum) and is then destroyed. To recover it in that window, run `aws kms cancel-key-deletion` |
+
+Deletion takes a few minutes, mostly waiting for Lambda VPC network interfaces to be released.
+
+**Not removed**, because the stack doesn't own them:
+
+- **Your VPC, subnets, VPC endpoints and the artifact S3 bucket.** The agent zips that `deploy.sh` uploaded under `agentcore-poc/` stay in the bucket. Delete them with `aws s3 rm s3://<bucket>/agentcore-poc/ --recursive`.
+- **Recovery points made by your organisation's backup policy** (from the `dynamodbbackup` tag). Those live in the org's vault under its retention rules.
+- **The account-level API Gateway CloudWatch setting:** if you deployed with `CREATE_APIGW_ACCOUNT_ROLE=true`, deleting the stack deletes that role. The account setting keeps pointing at it, so other APIs' logging in that account and region stops until it's set again.

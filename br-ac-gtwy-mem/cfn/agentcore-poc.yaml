@@ -1,0 +1,1601 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentCore POC (single stack). Uses an EXISTING VPC, subnets and VPC endpoints.
+  Strands agent on AgentCore Runtime -> AgentCore Gateway (MCP) -> tool Lambda ->
+  private API Gateway (IAM auth, SigV4) -> Lambda -> DynamoDB. AgentCore Memory gives
+  the agent short-term (conversation) and long-term (facts, preferences, summaries) memory.
+  Custom resources seed sample data
+  and take an on-demand DynamoDB backup. A customer managed KMS key encrypts every resource
+  that supports one.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Existing network }
+        Parameters: [VpcId, PrivateSubnetIds, ExecuteApiVpceId]
+      - Label: { default: Agent }
+        Parameters:
+          [ArtifactBucket, AgentCodeKey, ModelId, MemoryEventExpiryDays]
+      - Label: { default: "Encryption, backup and API controls" }
+        Parameters: [ExistingKmsKeyArn, CreateApiGatewayAccountRole]
+      - Label: { default: Required tags }
+        Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
+      - Label: { default: General }
+        Parameters: [ProjectName, StageName]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: br-ac-gtwy-mem
+    AllowedPattern: "^[a-z][a-z0-9-]{2,29}$"
+  StageName:
+    Type: String
+    Default: dev
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Existing private subnets (2+ AZs) for Lambdas and AgentCore Runtime ENIs
+  ExecuteApiVpceId:
+    Type: String
+    AllowedPattern: "^vpce-[0-9a-f]+$"
+    Description: Existing execute-api interface endpoint ID (private API is pinned to it)
+  ArtifactBucket:
+    Type: String
+    Description: Existing S3 bucket holding the agent code zip
+  AgentCodeKey:
+    Type: String
+    Description: S3 key of the agent zip. A new key forces a runtime update.
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: Bedrock model or inference-profile ID enabled in this account/region
+  MemoryEventExpiryDays:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 365
+    Description: Days AgentCore Memory keeps raw conversation events (short-term memory)
+  ExistingKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]{36}$"
+    Description: >
+      Leave blank to create a customer managed key for this stack. To use an existing CMK,
+      give its key ARN (not an alias) and add the key policy statements from the README.
+  CreateApiGatewayAccountRole:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >
+      API Gateway access logging needs a CloudWatch Logs role in the account-level API Gateway
+      settings (one per account and region). Set true ONLY if the account has none - this
+      overwrites the existing account setting.
+
+  # ---- Required tags ----
+  AppCatID:
+    Type: String
+    MinLength: 1
+    Default: 12345
+  ServiceName:
+    Type: String
+    Default: AgentCore POC
+    MinLength: 1
+  SupportTeam:
+    Type: String
+    MinLength: 1
+    Default: "CLOUD"
+  Environment:
+    Type: String
+    Default: dev
+    MinLength: 1
+
+Conditions:
+  CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
+  CreateApiGwAccount: !Equals [!Ref CreateApiGatewayAccountRole, "true"]
+
+Resources:
+  # =====================================================================
+  # Customer managed KMS key - used by DynamoDB (incl. its backups), CloudWatch log
+  # groups (incl. API access logs), Lambda environment variables and the
+  # AgentCore Gateway and AgentCore Memory. Skipped when ExistingKmsKeyArn is set.
+  # The gateway service role gets key use through an IAM policy (GatewayKmsPolicy),
+  # enabled by the EnableIamPolicies statement.
+  # =====================================================================
+  KmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateKmsKey
+    DeletionPolicy: Delete # stack delete schedules key deletion (7-day minimum KMS wait)
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "CMK for data at rest"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Description: !Sub "${ProjectName} - CMK for data at rest"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal:
+              { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action:
+              [
+                kms:Encrypt*,
+                kms:Decrypt*,
+                kms:ReEncrypt*,
+                kms:GenerateDataKey*,
+                kms:Describe*,
+              ]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateKmsKey
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}"
+      TargetKeyId: !Ref KmsKey
+
+  # =====================================================================
+  # Network (existing VPC) - only the workload security group is created
+  # =====================================================================
+  WorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Workload SG for Lambdas and AgentCore Runtime"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: !Sub "${ProjectName}-workload-sg"
+      GroupDescription: !Sub "${ProjectName} workloads (Lambda, AgentCore Runtime)"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to VPC endpoints
+
+  # =====================================================================
+  # DynamoDB
+  # =====================================================================
+  CustomersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete # deleted with the stack (TableDeletionGuard lifts deletion protection first)
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Customer records for the sample API"
+        - Key: dynamodbbackup # DDB.11 - org backup policy; literal so the hook can read it
+          Value: "True"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      TableName: !Sub "${ProjectName}-customers"
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true # disable before deleting the stack (see README)
+      AttributeDefinitions:
+        - { AttributeName: customerId, AttributeType: S }
+        - { AttributeName: email, AttributeType: S }
+      KeySchema:
+        - { AttributeName: customerId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - { AttributeName: email, KeyType: HASH }
+          Projection:
+            ProjectionType: KEYS_ONLY
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  # =====================================================================
+  # Deploy-time helper Lambda for the custom resources
+  #   Custom::SeedCustomers           - writes sample customers (never overwrites)
+  #   Custom::DynamoDbOnDemandBackup  - on-demand backup, deleted with the stack
+  #   Custom::TableDeletionGuard      - lifts table deletion protection on stack delete
+  #   Custom::RuntimeLogCleanup       - deletes the runtime's service-created log group
+  # =====================================================================
+  DeployHelperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Role for deploy-time custom resources"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: deploy-helper
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  [
+                    dynamodb:PutItem,
+                    dynamodb:CreateBackup,
+                    dynamodb:UpdateTable,
+                    dynamodb:DescribeTable,
+                  ]
+                Resource: !GetAtt CustomersTable.Arn
+              - Effect: Allow
+                Action: dynamodb:DeleteBackup
+                Resource: !Sub "${CustomersTable.Arn}/backup/*"
+              - Sid: RuntimeLogCleanup
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: RuntimeLogCleanupDelete
+                Effect: Allow
+                Action: logs:DeleteLogGroup
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: UseCmkViaDynamoDb
+                Effect: Allow
+                Action:
+                  [
+                    kms:Encrypt,
+                    kms:Decrypt,
+                    kms:ReEncrypt*,
+                    kms:GenerateDataKey*,
+                    kms:DescribeKey,
+                    kms:CreateGrant,
+                  ]
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "dynamodb.${AWS::Region}.amazonaws.com"
+              - Sid: DecryptEnvVars
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  DeployHelperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the deploy helper Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-deploy-helper"
+      RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  DeployHelperFn:
+    Type: AWS::Lambda::Function
+    DependsOn: DeployHelperLogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Deploy-time custom resources"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      FunctionName: !Sub "${ProjectName}-deploy-helper"
+      Description: CloudFormation custom resources (seed, backup, delete-time cleanup)
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt DeployHelperRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+      # Deliberately NOT in the VPC (same pattern as the RAG POC's schema-init Lambda).
+      # It only runs at deploy time, calls DynamoDB and CloudWatch Logs APIs, and must
+      # PUT its result to CloudFormation's pre-signed S3 URL, which these private subnets
+      # can't resolve. The org hook reports this as a warning (Lam.23), not an error.
+      Code:
+        ZipFile: |
+          import json, time, threading, urllib.request
+          from decimal import Decimal
+          import boto3
+          from botocore.exceptions import ClientError
+
+          def send(event, context, status, physical_id, data=None, reason=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or f"See CloudWatch log stream {context.log_stream_name}")[:1000],
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": "", "Content-Length": str(len(body))})
+              for attempt in range(5):
+                  try:
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          print(f"CloudFormation response {status} -> HTTP {r.status}")
+                          return
+                  except Exception as e:
+                      print(f"Failed to send CloudFormation response (attempt {attempt + 1}/5): {e}")
+                      time.sleep(2)
+              print("Gave up sending the CloudFormation response; the stack will wait for ServiceTimeout")
+
+          # ---------- Custom::SeedCustomers ----------
+          SEED = [
+              {"customerId": "C-1001", "firstName": "Alice", "lastName": "Nguyen", "email": "alice.nguyen@example.com",
+               "segment": "RETAIL", "status": "ACTIVE", "city": "Toronto", "province": "ON",
+               "accounts": [{"type": "CHEQUING", "balance": Decimal("4520.15")},
+                            {"type": "SAVINGS", "balance": Decimal("18200.00")}],
+               "createdAt": "2021-03-14T10:22:00+00:00"},
+              {"customerId": "C-1002", "firstName": "Brian", "lastName": "Okafor", "email": "brian.okafor@example.com",
+               "segment": "SMALL_BUSINESS", "status": "ACTIVE", "city": "Calgary", "province": "AB",
+               "accounts": [{"type": "BUSINESS_CHEQUING", "balance": Decimal("61234.90")}],
+               "createdAt": "2019-11-02T15:05:00+00:00"},
+              {"customerId": "C-1003", "firstName": "Chantal", "lastName": "Roy", "email": "chantal.roy@example.com",
+               "segment": "WEALTH", "status": "DORMANT", "city": "Montreal", "province": "QC",
+               "accounts": [{"type": "INVESTMENT", "balance": Decimal("250000.00")}],
+               "createdAt": "2015-06-30T09:00:00+00:00"},
+              {"customerId": "C-1004", "firstName": "Devon", "lastName": "Singh", "email": "devon.singh@example.com",
+               "segment": "RETAIL", "status": "ACTIVE", "city": "Ottawa", "province": "ON",
+               "accounts": [{"type": "CHEQUING", "balance": Decimal("812.40")},
+                            {"type": "CREDIT_CARD", "balance": Decimal("-1290.55")}],
+               "createdAt": "2023-08-21T13:40:00+00:00"},
+          ]
+
+          def seed(event):
+              if event["RequestType"] == "Delete":
+                  return event.get("PhysicalResourceId", "seed"), {}   # table is deleted with the stack
+              table = boto3.resource("dynamodb").Table(event["ResourceProperties"]["TableName"])
+              written = 0
+              for item in SEED:
+                  try:
+                      table.put_item(Item=item, ConditionExpression="attribute_not_exists(customerId)")
+                      written += 1
+                  except ClientError as e:
+                      if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                          raise
+              return f"seed-{event['ResourceProperties']['TableName']}", {"Written": str(written)}
+
+          # ---------- Custom::DynamoDbOnDemandBackup ----------
+          def on_demand_backup(event):
+              # Native DynamoDB on-demand backup (encrypted with the table's CMK). Taken on
+              # create and whenever BackupVersion changes. Deleted on stack delete; when
+              # BackupVersion changes, CloudFormation deletes the previous backup.
+              p = event["ResourceProperties"]
+              if event["RequestType"] == "Delete":
+                  pid = event.get("PhysicalResourceId", "")
+                  if pid.startswith("arn:"):
+                      try:
+                          boto3.client("dynamodb").delete_backup(BackupArn=pid)
+                          print(f"Deleted backup {pid}")
+                      except ClientError as e:
+                          if e.response["Error"]["Code"] not in ("BackupNotFoundException", "ResourceNotFoundException"):
+                              raise
+                  return pid or "backup", {}
+              old = event.get("OldResourceProperties", {})
+              if event["RequestType"] == "Update" and old.get("BackupVersion") == p.get("BackupVersion"):
+                  return event["PhysicalResourceId"], {}
+              name = f"{p['TableName']}-ondemand-v{p.get('BackupVersion', '1')}"[:255]
+              b = boto3.client("dynamodb").create_backup(TableName=p["TableName"], BackupName=name)
+              arn = b["BackupDetails"]["BackupArn"]
+              return arn, {"BackupArn": arn}
+
+          # ---------- Custom::TableDeletionGuard ----------
+          def table_deletion_guard(event):
+              # Deletion protection stays ON for the table's life. This resource depends on
+              # the table, so CloudFormation deletes it first: we turn protection off and
+              # wait for ACTIVE so the table delete that follows succeeds.
+              p = event["ResourceProperties"]
+              pid = f"deletion-guard-{p['TableName']}"
+              if event["RequestType"] != "Delete":
+                  return pid, {}
+              ddb = boto3.client("dynamodb")
+              try:
+                  ddb.update_table(TableName=p["TableName"], DeletionProtectionEnabled=False)
+                  ddb.get_waiter("table_exists").wait(TableName=p["TableName"],
+                                                      WaiterConfig={"Delay": 2, "MaxAttempts": 45})
+                  print(f"Deletion protection disabled on {p['TableName']}")
+              except ClientError as e:
+                  if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                      raise
+              return pid, {}
+
+          # ---------- Custom::RuntimeLogCleanup ----------
+          def runtime_log_cleanup(event):
+              # AgentCore Runtime creates /aws/bedrock-agentcore/runtimes/<name>-<suffix>-<endpoint>
+              # itself, so CloudFormation doesn't own it. The runtime depends on this resource,
+              # so on stack delete this runs after the runtime is gone.
+              p = event["ResourceProperties"]
+              name = p["RuntimeName"]
+              prefix = f"/aws/bedrock-agentcore/runtimes/{name}-"
+              if event["RequestType"] != "Delete":
+                  return f"log-cleanup-{name}", {"RuntimeName": name}
+              logs = boto3.client("logs")
+              for page in logs.get_paginator("describe_log_groups").paginate(logGroupNamePrefix=prefix):
+                  for g in page["logGroups"]:
+                      try:
+                          logs.delete_log_group(logGroupName=g["logGroupName"])
+                          print(f"Deleted log group {g['logGroupName']}")
+                      except ClientError as e:
+                          if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                              raise
+              return event.get("PhysicalResourceId", f"log-cleanup-{name}"), {}
+
+          HANDLERS = {"Custom::SeedCustomers": seed,
+                      "Custom::DynamoDbOnDemandBackup": on_demand_backup,
+                      "Custom::TableDeletionGuard": table_deletion_guard,
+                      "Custom::RuntimeLogCleanup": runtime_log_cleanup}
+
+          def handler(event, context):
+              safe = {k: v for k, v in event.items() if k != "ResponseURL"}
+              print(json.dumps(safe))
+              pid = event.get("PhysicalResourceId") or f"failed-{event['RequestId']}"
+              done = threading.Event()
+
+              def respond(status, physical_id, data=None, reason=None):
+                  if done.is_set():
+                      return
+                  done.set()
+                  send(event, context, status, physical_id, data, reason)
+
+              # Safety net: always answer CloudFormation before Lambda kills the invocation.
+              guard = threading.Timer(max(context.get_remaining_time_in_millis() / 1000 - 20, 1),
+                                      lambda: respond("FAILED", pid, reason="Timed out - see deploy-helper logs"))
+              guard.daemon = True
+              guard.start()
+              try:
+                  fn = HANDLERS.get(event["ResourceType"])
+                  if fn is None and event["RequestType"] == "Delete":
+                      # A resource type this helper no longer manages (e.g. the retired
+                      # Custom::CognitoM2MClient) - let CloudFormation remove it cleanly.
+                      print(f"Retired resource type {event['ResourceType']}: delete is a no-op")
+                      respond("SUCCESS", pid)
+                      return
+                  if fn is None:
+                      raise ValueError(f"Unknown resource type {event['ResourceType']}")
+                  new_pid, data = fn(event)
+                  respond("SUCCESS", new_pid, data)
+              except Exception as e:
+                  print(f"ERROR {type(e).__name__}: {e}")
+                  respond("FAILED", pid, reason=f"{type(e).__name__}: {e}")
+              finally:
+                  guard.cancel()
+
+  SeedCustomers:
+    Type: Custom::SeedCustomers
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      TableName: !Ref CustomersTable
+      SeedVersion: "1" # bump to re-run (existing IDs are never overwritten)
+
+  # Deletes the runtime's service-created log group (/aws/bedrock-agentcore/runtimes/<name>-*)
+  # after the runtime itself is deleted. It also supplies the runtime name (GetAtt RuntimeName).
+  RuntimeLogCleanup:
+    Type: Custom::RuntimeLogCleanup
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      RuntimeName: !Join ["_", !Split ["-", !Sub "${ProjectName}_agent"]]
+
+  # Created right after the table, so it also covers a rollback of a failed create.
+  TableDeletionGuard:
+    Type: Custom::TableDeletionGuard
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      TableName: !Ref CustomersTable
+
+  OnDemandBackup:
+    Type: Custom::DynamoDbOnDemandBackup
+    DependsOn: SeedCustomers
+    Properties:
+      ServiceToken: !GetAtt DeployHelperFn.Arn
+      ServiceTimeout: 300
+      TableName: !Ref CustomersTable
+      BackupVersion: "1" # bump to take another on-demand backup
+
+  # =====================================================================
+  # Customer API Lambda (DynamoDB CRUD)
+  # =====================================================================
+  CustomerApiFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Role for the customer API Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: customers-table
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  [
+                    dynamodb:GetItem,
+                    dynamodb:PutItem,
+                    dynamodb:Scan,
+                    dynamodb:Query,
+                  ]
+                Resource:
+                  - !GetAtt CustomersTable.Arn
+                  - !Sub "${CustomersTable.Arn}/index/*"
+              - Sid: UseCmkViaDynamoDb
+                Effect: Allow
+                Action:
+                  [
+                    kms:Encrypt,
+                    kms:Decrypt,
+                    kms:ReEncrypt*,
+                    kms:GenerateDataKey*,
+                    kms:DescribeKey,
+                    kms:CreateGrant,
+                  ]
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "dynamodb.${AWS::Region}.amazonaws.com"
+              - Sid: DecryptEnvVars
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  CustomerApiFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the customer API Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-api"
+      RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  CustomerApiFn:
+    Type: AWS::Lambda::Function
+    DependsOn: CustomerApiFnLogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Customer API backend - DynamoDB CRUD"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      FunctionName: !Sub "${ProjectName}-customer-api"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt CustomerApiFnRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [!Ref WorkloadSecurityGroup]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CustomersTable
+      Code:
+        ZipFile: |
+          import json, os, re, uuid, datetime
+          from decimal import Decimal
+          import boto3
+          from boto3.dynamodb.conditions import Attr, Key
+          from botocore.config import Config
+
+          # Short timeouts: a blocked DynamoDB path returns a logged 500 quickly instead of
+          # hanging until API Gateway's 29 s integration timeout.
+          table = boto3.resource("dynamodb", config=Config(connect_timeout=3, read_timeout=5,
+                                 retries={"max_attempts": 2})).Table(os.environ["TABLE_NAME"])
+          REQUIRED = ("firstName", "lastName", "email")
+          SEGMENTS = {"RETAIL", "SMALL_BUSINESS", "WEALTH"}
+          EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+          CID_RE = re.compile(r"^C-[0-9A-F]{4,8}$")
+
+          def _json(o):
+              if isinstance(o, Decimal):
+                  return int(o) if o == o.to_integral_value() else float(o)
+              raise TypeError(type(o))
+
+          def _resp(code, body):
+              return {"statusCode": code,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps(body, default=_json)}
+
+          def list_customers(qs):
+              # POC: Scan + filter. Add GSIs for real access patterns.
+              cond = None
+              for key in ("status", "segment", "province"):
+                  if qs.get(key):
+                      c = Attr(key).eq(qs[key].upper())
+                      cond = c if cond is None else cond & c
+              kwargs = {"FilterExpression": cond} if cond is not None else {}
+              items, resp = [], table.scan(**kwargs)
+              items += resp["Items"]
+              while "LastEvaluatedKey" in resp:
+                  resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+                  items += resp["Items"]
+              items.sort(key=lambda c: c["customerId"])
+              return _resp(200, {"count": len(items), "items": items})
+
+          def get_customer(cid):
+              cid = (cid or "").upper()
+              if not CID_RE.match(cid):
+                  return _resp(400, {"message": "customerId must look like C-1001"})
+              item = table.get_item(Key={"customerId": cid}).get("Item")
+              return _resp(200, item) if item else _resp(404, {"message": f"Customer {cid} not found"})
+
+          def create_customer(raw):
+              try:
+                  body = json.loads(raw or "{}")
+              except json.JSONDecodeError:
+                  return _resp(400, {"message": "Body must be valid JSON"})
+              missing = [f for f in REQUIRED if not str(body.get(f, "")).strip()]
+              if missing:
+                  return _resp(400, {"message": f"Missing fields: {', '.join(missing)}"})
+              email = body["email"].strip().lower()
+              if not EMAIL_RE.match(email):
+                  return _resp(400, {"message": "Invalid email"})
+              segment = str(body.get("segment") or "RETAIL").upper()
+              if segment not in SEGMENTS:
+                  return _resp(400, {"message": f"segment must be one of {sorted(SEGMENTS)}"})
+              if table.query(IndexName="email-index", KeyConditionExpression=Key("email").eq(email))["Items"]:
+                  return _resp(409, {"message": f"A customer with email {email} already exists"})
+              item = {
+                  "customerId": f"C-{uuid.uuid4().hex[:6].upper()}",
+                  "firstName": body["firstName"].strip(), "lastName": body["lastName"].strip(),
+                  "email": email, "segment": segment, "status": "PENDING_KYC",
+                  "accounts": [],
+                  "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+              }
+              for opt in ("city", "province"):
+                  if body.get(opt):
+                      item[opt] = str(body[opt]).strip().upper() if opt == "province" else str(body[opt]).strip()
+              table.put_item(Item=item, ConditionExpression="attribute_not_exists(customerId)")
+              return _resp(201, item)
+
+          def handler(event, context):
+              ident = (event.get("requestContext") or {}).get("identity") or {}
+              print(json.dumps({"method": event.get("httpMethod"), "resource": event.get("resource"),
+                                "caller": ident.get("userArn"), "vpce": ident.get("vpceId")}))
+              method, resource = event.get("httpMethod"), event.get("resource")
+              try:
+                  if method == "GET" and resource == "/customers":
+                      return list_customers(event.get("queryStringParameters") or {})
+                  if method == "GET" and resource == "/customers/{customerId}":
+                      return get_customer((event.get("pathParameters") or {}).get("customerId"))
+                  if method == "POST" and resource == "/customers":
+                      return create_customer(event.get("body"))
+                  return _resp(405, {"message": f"{method} {resource} not supported"})
+              except Exception as e:
+                  print(f"ERROR {type(e).__name__}: {e}")
+                  hint = " - check the DynamoDB gateway endpoint on the Lambda subnets' route tables" \
+                      if "timeout" in str(e).lower() or "connect" in str(e).lower() else ""
+                  return _resp(500, {"message": f"Internal error ({type(e).__name__}){hint}"})
+
+  # =====================================================================
+  # API Gateway (private REST, IAM auth)
+  # =====================================================================
+  CustomerApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Private customer REST API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-customer-api"
+      Description: Private customer API (IAM auth) for the AgentCore POC
+      EndpointConfiguration:
+        Types: [PRIVATE]
+        VpcEndpointIds: [!Ref ExecuteApiVpceId]
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          # IAM principals in this account whose own IAM policy allows execute-api:Invoke
+          # (the tool Lambda role). With AWS_IAM auth every request must be SigV4-signed.
+          - Sid: AllowIamPrincipalsInThisAccount
+            Effect: Allow
+            Principal:
+              { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: execute-api:Invoke
+            Resource: execute-api:/*
+          - Sid: OnlyThroughTheVpcEndpoint
+            Effect: Deny
+            Principal: "*"
+            Action: execute-api:Invoke
+            Resource: execute-api:/*
+            Condition:
+              StringNotEquals:
+                aws:SourceVpce: !Ref ExecuteApiVpceId
+
+  CustomersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ParentId: !GetAtt CustomerApi.RootResourceId
+      PathPart: customers
+
+  CustomerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ParentId: !Ref CustomersResource
+      PathPart: "{customerId}"
+
+  ListCustomersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ResourceId: !Ref CustomersResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      RequestParameters:
+        method.request.querystring.status: false
+        method.request.querystring.segment: false
+        method.request.querystring.province: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerApiFn.Arn}/invocations"
+
+  CreateCustomerMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ResourceId: !Ref CustomersResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerApiFn.Arn}/invocations"
+
+  GetCustomerMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CustomerApi
+      ResourceId: !Ref CustomerIdResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      RequestParameters:
+        method.request.path.customerId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerApiFn.Arn}/invocations"
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CustomerApiFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomerApi}/*/*/*"
+
+  # API Gateway only applies method, authorizer and resource-policy changes when a NEW
+  # deployment is created, and CloudFormation won't create one unless this resource changes.
+  # Bump the suffix (V2 -> V3 ...) whenever you change methods, auth or the API's resource policy.
+  # V2 = IAM auth (replaces the Cognito-authorizer deployment).
+  ApiDeploymentV2:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ListCustomersMethod, CreateCustomerMethod, GetCustomerMethod]
+    Properties:
+      RestApiId: !Ref CustomerApi
+
+  # Execution log group. API Gateway writes to exactly this name; creating it here gives it the
+  # CMK, a retention period and deletion with the stack.
+  ApiExecutionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Execution logs for the customer API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "API-Gateway-Execution-Logs_${CustomerApi}/${StageName}"
+      RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Access logs for the customer API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-customer-api/access"
+      RetentionInDays: 90
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  # Account-level setting (one per account/region) required for API Gateway logging.
+  # Only created when CreateApiGatewayAccountRole=true.
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: CreateApiGwAccount
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "API Gateway account logging role"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: CreateApiGwAccount
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiExecutionLogGroup # group must exist (with the CMK) before API Gateway writes to it
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Customer API stage"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ApplyCommonWaf
+          Value: "true" # literal on purpose (the org hook needs a literal true/false, not !Ref)
+      RestApiId: !Ref CustomerApi
+      DeploymentId: !Ref ApiDeploymentV2
+      StageName: !Ref StageName
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","extendedRequestId":"$context.extendedRequestId",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath","path":"$context.path","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength",
+          "responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency",
+          "sourceIp":"$context.identity.sourceIp","vpceId":"$context.identity.vpceId",
+          "caller":"$context.identity.userArn","callerAccount":"$context.identity.accountId",
+          "xrayTraceId":"$context.xrayTraceId","errorMessage":"$context.error.message",
+          "wafResponseCode":"$context.wafResponseCode","webAclArn":"$context.webaclArn",
+          "authError":"$context.error.responseType"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          LoggingLevel: INFO # execution logs: auth / resource-policy / integration decisions
+          DataTraceEnabled: false # no request/response bodies in logs
+
+  # =====================================================================
+  # MCP tool Lambda (Gateway target) - SigV4-signed calls to the private API
+  # =====================================================================
+  ToolFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Role for the MCP tool Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: invoke-customer-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeCustomerApi
+                Effect: Allow
+                Action: execute-api:Invoke
+                Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${CustomerApi}/*/*/*"
+              - Sid: DecryptEnvVars
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  ToolFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the MCP tool Lambda"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-tools"
+      RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  ToolFn:
+    Type: AWS::Lambda::Function
+    DependsOn: ToolFnLogGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "MCP tool - calls the customer API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      FunctionName: !Sub "${ProjectName}-customer-tools"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt ToolFnRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [!Ref WorkloadSecurityGroup]
+      Environment:
+        Variables:
+          # API-specific endpoint hostname ({api-id}-{vpce-id}). Routes to this API through the
+          # associated execute-api endpoint even when that endpoint is shared from another account
+          # and has private DNS disabled (the plain {api-id}.execute-api name then returns 403 Forbidden).
+          API_BASE_URL: !Sub "https://${CustomerApi}-${ExecuteApiVpceId}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+          LOG_LEVEL: INFO # DEBUG adds botocore wire-level logs
+      Code:
+        ZipFile: |
+          import ipaddress, json, logging, os, socket, threading, time, urllib.request, urllib.error, urllib.parse
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          log = logging.getLogger()
+          log.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+          if os.environ.get("LOG_LEVEL") == "DEBUG":
+              boto3.set_stream_logger("botocore", logging.DEBUG)
+
+          BASE = os.environ["API_BASE_URL"].rstrip("/")
+          REGION = os.environ["AWS_REGION"]
+          API_HOST = urllib.parse.urlparse(BASE).hostname
+          DELIM = "___"  # Gateway sends "<targetName>___<toolName>"
+          # Descriptive User-Agent: WAF managed rules (e.g. Bot Control's HTTP-library category)
+          # commonly block Python's default "Python-urllib/x.y".
+          USER_AGENT = os.environ.get("API_USER_AGENT", "agentcore-poc-customer-tools/1.0 (AWS Lambda)")
+          session = boto3.Session()
+          _probes = {}
+
+          log.info("config: api=%s region=%s auth=IAM (SigV4 with this function's role) user_agent=%s", BASE, REGION, USER_AGENT)
+
+
+          class Blocked(Exception):
+              """A network call from the VPC can't get through."""
+
+
+          def _ms(t):
+              return int((time.time() - t) * 1000)
+
+
+          # ---------------------------------------------------------------------------
+          # Network check: DNS (with its own timeout - socket timeouts don't cover DNS)
+          # and a TCP connect on 443. Runs once per host per cold start and is logged.
+          # ---------------------------------------------------------------------------
+          def probe(host, endpoint_name):
+              if host in _probes:
+                  return _probes[host]
+              t = time.time()
+              box = {}
+
+              def resolve():
+                  try:
+                      box["ips"] = sorted({a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)})
+                  except Exception as e:
+                      box["err"] = e
+
+              th = threading.Thread(target=resolve, daemon=True)
+              th.start()
+              th.join(3)
+              if th.is_alive():
+                  problem = f"DNS lookup of {host} timed out after 3 s"
+              elif "err" in box:
+                  problem = f"DNS lookup of {host} failed ({box['err']})"
+              else:
+                  ips = box["ips"]
+                  kinds = ["private" if ipaddress.ip_address(ip).is_private else "PUBLIC" for ip in ips]
+                  log.info("net: %s -> %s in %d ms", host, ", ".join(f"{ip} ({k})" for ip, k in zip(ips, kinds)), _ms(t))
+                  problem = None
+                  if "PUBLIC" in kinds:
+                      log.warning("net: %s resolves to public IPs - the %s VPC endpoint's private DNS is off "
+                                  "(or there is no endpoint), so traffic only works via a NAT", host, endpoint_name)
+                  t2 = time.time()
+                  try:
+                      socket.create_connection((ips[0], 443), timeout=3).close()
+                      log.info("net: TCP 443 to %s (%s) ok in %d ms", ips[0], host, _ms(t2))
+                  except Exception as e:
+                      problem = f"TCP 443 to {ips[0]} ({host}) failed after {_ms(t2)} ms ({e})"
+              if problem:
+                  problem += (f". Check the {endpoint_name} VPC endpoint: private DNS enabled, in this Lambda's "
+                              "subnets/AZs, and its security group allows 443 from the VPC range")
+                  log.error("net: %s", problem)
+              _probes[host] = problem
+              return problem
+
+
+          def _signed(method, url, data):
+              """Build a urllib request SigV4-signed for execute-api with the Lambda role's credentials."""
+              aws_req = AWSRequest(method=method, url=url, data=data, headers={"Content-Type": "application/json"})
+              SigV4Auth(session.get_credentials().get_frozen_credentials(), "execute-api", REGION).add_auth(aws_req)
+              headers = dict(aws_req.headers)
+              headers["User-Agent"] = USER_AGENT   # not part of the signature, so it can be set after signing
+              return urllib.request.Request(url, data=data, method=method, headers=headers)
+
+
+          def _call(method, path, body=None, query=None):
+              url = BASE + path
+              if query:
+                  q = {k: v for k, v in query.items() if v}
+                  if q:
+                      url += "?" + urllib.parse.urlencode(q)
+              if (p := probe(API_HOST, "execute-api")):
+                  raise Blocked(p)
+              data = json.dumps(body).encode() if body is not None else None
+              req = _signed(method, url, data)
+              log.info("api: %s %s body=%s ...", method, url, (data or b"")[:300].decode())
+              t = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=12) as r:
+                      raw = r.read()
+                      log.info("api: %s %s -> %d in %d ms (%d bytes)", method, path, r.status, _ms(t), len(raw))
+                      return {"status": r.status, "data": json.loads(raw or b"{}")}
+              except urllib.error.HTTPError as e:
+                  raw = e.read() or b"{}"
+                  etype = e.headers.get("x-amzn-errortype", "")
+                  log.warning("api: %s %s -> %d in %d ms: %s (x-amzn-errortype=%s, apigw request id=%s)", method, path,
+                              e.code, _ms(t), raw[:300], etype, e.headers.get("x-amzn-requestid"))
+                  if e.code == 403 and raw.strip() == b'{"message":"Forbidden"}':
+                      log.warning("api: a bare 'Forbidden' is usually AWS WAF - check wafResponseCode / webAclArn "
+                                  "in the API access log for this request id")
+                  elif e.code == 403:
+                      if "Signature" in etype or "Signature" in raw.decode(errors="replace"):
+                          log.warning("api: signature rejected - check the request is signed for execute-api in %s", REGION)
+                      else:
+                          log.warning("api: 403 means this role lacks execute-api:Invoke on the API, or the request "
+                                      "didn't arrive through the execute-api endpoint the API is pinned to (ExecuteApiVpceId)")
+                  try:
+                      err = json.loads(raw)
+                  except ValueError:
+                      err = {"message": e.reason}
+                  return {"status": e.code, "error": err}
+              except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+                  raise Blocked(f"Customer API {method} {url} failed after {_ms(t)} ms: {e}. A slow 504 points at the "
+                                "API Lambda / DynamoDB; a connect error at the execute-api endpoint")
+
+
+          def handler(event, context):
+              cc = getattr(context, "client_context", None)
+              full = (cc.custom or {}).get("bedrockAgentCoreToolName", "") if cc else ""
+              tool = full.split(DELIM, 1)[-1]
+              log.info("tool=%s args=%s (time left %d ms)", tool, json.dumps(event, separators=(",", ":"))[:500],
+                       context.get_remaining_time_in_millis())
+              t = time.time()
+              try:
+                  if tool == "list_customers":
+                      out = _call("GET", "/customers", query={k: event.get(k) for k in ("status", "segment", "province")})
+                  elif tool == "get_customer":
+                      cid = urllib.parse.quote(str(event.get("customerId", "")), safe="")
+                      out = _call("GET", f"/customers/{cid}")
+                  elif tool == "create_customer":
+                      allowed = ("firstName", "lastName", "email", "segment", "city", "province")
+                      out = _call("POST", "/customers", body={k: event[k] for k in allowed if k in event})
+                  else:
+                      out = {"status": 400, "error": {"message": f"Unknown tool '{tool}'"}}
+              except Blocked as e:
+                  log.error("BLOCKED after %d ms: %s", _ms(t), e)
+                  out = {"status": 504, "error": {"message": f"Network path blocked: {e}"}}
+              except Exception as e:
+                  log.exception("tool %s failed", tool)
+                  out = {"status": 500, "error": {"message": f"{type(e).__name__}: {e}"}}
+              log.info("tool=%s status=%s in %d ms result=%s", tool, out.get("status"), _ms(t),
+                       json.dumps(out, separators=(",", ":"))[:500])
+              return out
+
+  # =====================================================================
+  # AgentCore Gateway (MCP)
+  # =====================================================================
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Gateway service role"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-tool-lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ARN built from the function name (not !GetAtt) to avoid a cycle:
+              # KMS key policy -> GatewayRole -> ToolFn -> KMS key
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-customer-tools"
+
+  # The gateway encrypts its configuration with the CMK using its service role.
+  # Granted in IAM: a key-policy grant with kms:ViaService/encryption-context
+  # conditions was rejected at create time ("no identity-based policy allows").
+  GatewayKmsPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref GatewayRole
+      PolicyName: use-stack-cmk
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              [
+                kms:DescribeKey,
+                kms:Decrypt,
+                kms:GenerateDataKey,
+                kms:CreateGrant,
+              ]
+            Resource:
+              !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  McpGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    DependsOn: GatewayKmsPolicy
+    Properties:
+      Tags:
+        AppCatID: !Ref AppCatID
+        Description: "AgentCore MCP gateway for customer tools"
+        ServiceName: !Ref ServiceName
+        Support-Team: !Ref SupportTeam
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+      Name: !Sub "${ProjectName}-gw"
+      Description: MCP gateway exposing customer API tools
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt GatewayRole.Arn
+      KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+      ExceptionLevel: DEBUG # POC only - remove for anything beyond a POC
+
+  CustomerToolsTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt McpGateway.GatewayIdentifier
+      Name: customer-tools
+      Description: Customer API (GET/POST) via Lambda
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt ToolFn.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: list_customers
+                  Description: List customers, optionally filtered by status, segment or province.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      status:
+                        Type: string
+                        Description: ACTIVE, DORMANT or PENDING_KYC
+                      segment:
+                        Type: string
+                        Description: RETAIL, SMALL_BUSINESS or WEALTH
+                      province:
+                        Type: string
+                        Description: Two-letter Canadian province code, e.g. ON
+                - Name: get_customer
+                  Description: Get a single customer's profile and accounts by customer ID (e.g. C-1001).
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      customerId:
+                        Type: string
+                        Description: Customer ID, format C-XXXX
+                    Required: [customerId]
+                - Name: create_customer
+                  Description: Create (onboard) a new customer. Returns the new customer with status PENDING_KYC.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      firstName: { Type: string }
+                      lastName: { Type: string }
+                      email: { Type: string }
+                      segment:
+                        Type: string
+                        Description: RETAIL (default), SMALL_BUSINESS or WEALTH
+                      city: { Type: string }
+                      province: { Type: string }
+                    Required: [firstName, lastName, email]
+
+  # =====================================================================
+  # AgentCore Memory
+  #   Short-term: every conversation turn is stored as an event, keyed by
+  #               actorId (the user) + sessionId (the runtime session), and
+  #               replayed into the agent on the next call in the same session.
+  #   Long-term:  the strategies below extract records from those events in the
+  #               background (takes a minute or so) into per-user namespaces. The
+  #               agent searches facts + preferences on every prompt, across sessions.
+  # Built-in strategies need no execution role. Deleted with the stack.
+  # =====================================================================
+  AgentMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Tags:
+        AppCatID: !Ref AppCatID
+        Description: "AgentCore Memory for the customer agent"
+        ServiceName: !Ref ServiceName
+        Support-Team: !Ref SupportTeam
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+      Name: !Join ["_", !Split ["-", !Sub "${ProjectName}_memory"]] # letters, digits and _ only
+      Description: Short- and long-term memory for the customer agent
+      EventExpiryDuration: !Ref MemoryEventExpiryDays
+      EncryptionKeyArn:
+        !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+      MemoryStrategies:
+        # Namespaces must match MEMORY_NAMESPACES in customer_agent.py
+        - SemanticMemoryStrategy:
+            Name: CustomerFacts
+            Description: Facts learned in conversation (e.g. customers the user works with)
+            Namespaces: ["/facts/{actorId}/"]
+        - UserPreferenceMemoryStrategy:
+            Name: UserPreferences
+            Description: How the user likes answers (format, segments, provinces of interest)
+            Namespaces: ["/preferences/{actorId}/"]
+        - SummaryMemoryStrategy:
+            Name: SessionSummaries
+            Description: Running summary of each session
+            Namespaces: ["/summaries/{actorId}/{sessionId}/"]
+
+  # =====================================================================
+  # AgentCore Runtime (Strands agent, VPC mode)
+  # =====================================================================
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Runtime execution role"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+      Policies:
+        - PolicyName: agent-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Bedrock
+                Effect: Allow
+                Action:
+                  [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  # System cross-region profiles (us./global.) may be addressed with or without an account ID
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/*"
+              - Sid: ApplyGuardrail
+                Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+              - Sid: InvokeGateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !GetAtt McpGateway.GatewayArn
+              - Sid: Memory
+                Effect: Allow
+                Action:
+                  # short-term: conversation events
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:GetEvent
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:DeleteEvent
+                  - bedrock-agentcore:ListSessions
+                  # long-term: extracted records
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                  - bedrock-agentcore:ListMemoryRecords
+                  - bedrock-agentcore:GetMemoryRecord
+                Resource: !GetAtt AgentMemory.MemoryArn
+              - Sid: MemoryCmk
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+              - Sid: AgentCode
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${AgentCodeKey}"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  [
+                    logs:CreateLogGroup,
+                    logs:CreateLogStream,
+                    logs:PutLogEvents,
+                    logs:DescribeLogStreams,
+                    logs:DescribeLogGroups,
+                  ]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: Observability
+                Effect: Allow
+                Action:
+                  [
+                    xray:PutTraceSegments,
+                    xray:PutTelemetryRecords,
+                    cloudwatch:PutMetricData,
+                  ]
+                Resource: "*"
+                Condition:
+                  StringEqualsIfExists:
+                    { cloudwatch:namespace: bedrock-agentcore }
+
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    # Name comes from RuntimeLogCleanup, so that resource is created before the runtime
+    # and deleted after it - the log group is removed once the runtime is gone.
+    Properties:
+      Tags:
+        AppCatID: !Ref AppCatID
+        Description: "Strands customer agent"
+        ServiceName: !Ref ServiceName
+        Support-Team: !Ref SupportTeam
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+      AgentRuntimeName: !GetAtt RuntimeLogCleanup.RuntimeName
+      Description: Strands agent calling customer API tools through AgentCore Gateway (MCP)
+      RoleArn: !GetAtt RuntimeRole.Arn
+      ProtocolConfiguration: HTTP
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Runtime: PYTHON_3_12
+          EntryPoint: [customer_agent.py]
+          Code:
+            S3:
+              Bucket: !Ref ArtifactBucket
+              Prefix: !Ref AgentCodeKey
+      NetworkConfiguration:
+        NetworkMode: VPC
+        NetworkModeConfig:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref WorkloadSecurityGroup]
+      EnvironmentVariables:
+        GATEWAY_URL: !GetAtt McpGateway.GatewayUrl
+        MODEL_ID: !Ref ModelId
+        MEMORY_ID: !GetAtt AgentMemory.MemoryId
+        AWS_REGION_NAME: !Ref AWS::Region
+
+Outputs:
+  MemoryId:
+    Value: !GetAtt AgentMemory.MemoryId
+  MemoryArn:
+    Value: !GetAtt AgentMemory.MemoryArn
+  AgentRuntimeArn:
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+  GatewayUrl:
+    Value: !GetAtt McpGateway.GatewayUrl
+  CustomerApiId:
+    Value: !Ref CustomerApi
+  CustomerApiBaseUrl:
+    Description: API-specific endpoint URL ({api-id}-{vpce-id}); reachable only inside the VPC through the execute-api endpoint
+    Value: !Sub "https://${CustomerApi}-${ExecuteApiVpceId}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+  CustomersTableName:
+    Value: !Ref CustomersTable
+  ToolFunctionName:
+    Value: !Ref ToolFn
+  KmsKeyArn:
+    Description: Customer managed key used by this stack
+    Value: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+  OnDemandBackupArn:
+    Value: !Ref OnDemandBackup
+  ApiAccessLogGroup:
+    Value: !Ref ApiAccessLogGroup
+  ApiExecutionLogGroup:
+    Value: !Ref ApiExecutionLogGroup
+  WorkloadSecurityGroupId:
+    Description: Workload SG. Endpoint SGs should allow 443 from the VPC range (172.16.0.0/20), not reference this SG (a reference blocks stack deletion)
+    Value: !Ref WorkloadSecurityGroup

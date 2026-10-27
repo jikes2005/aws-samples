@@ -24,7 +24,7 @@ Metadata:
 Parameters:
   ProjectName:
     Type: String
-    Default: agentcore-poc
+    Default: br-ac-gtwy
     AllowedPattern: "^[a-z][a-z0-9-]{2,29}$"
   StageName:
     Type: String
@@ -97,7 +97,7 @@ Resources:
   KmsKey:
     Type: AWS::KMS::Key
     Condition: CreateKmsKey
-    DeletionPolicy: Delete             # stack delete schedules key deletion (7-day minimum KMS wait)
+    DeletionPolicy: Delete # stack delete schedules key deletion (7-day minimum KMS wait)
     UpdateReplacePolicy: Delete
     Properties:
       Tags:
@@ -121,13 +121,21 @@ Resources:
         Statement:
           - Sid: EnableIamPolicies
             Effect: Allow
-            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Principal:
+              { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
             Action: kms:*
             Resource: "*"
           - Sid: CloudWatchLogs
             Effect: Allow
             Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
-            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Action:
+              [
+                kms:Encrypt*,
+                kms:Decrypt*,
+                kms:ReEncrypt*,
+                kms:GenerateDataKey*,
+                kms:Describe*,
+              ]
             Resource: "*"
             Condition:
               ArnLike:
@@ -175,7 +183,7 @@ Resources:
   # =====================================================================
   CustomersTable:
     Type: AWS::DynamoDB::Table
-    DeletionPolicy: Delete          # deleted with the stack (TableDeletionGuard lifts deletion protection first)
+    DeletionPolicy: Delete # deleted with the stack (TableDeletionGuard lifts deletion protection first)
     UpdateReplacePolicy: Delete
     Properties:
       Tags:
@@ -183,7 +191,7 @@ Resources:
           Value: !Ref AppCatID
         - Key: Description
           Value: "Customer records for the sample API"
-        - Key: dynamodbbackup          # DDB.11 - org backup policy; literal so the hook can read it
+        - Key: dynamodbbackup # DDB.11 - org backup policy; literal so the hook can read it
           Value: "True"
         - Key: ServiceName
           Value: !Ref ServiceName
@@ -195,7 +203,7 @@ Resources:
           Value: !Ref ProjectName
       TableName: !Sub "${ProjectName}-customers"
       BillingMode: PAY_PER_REQUEST
-      DeletionProtectionEnabled: true   # disable before deleting the stack (see README)
+      DeletionProtectionEnabled: true # disable before deleting the stack (see README)
       AttributeDefinitions:
         - { AttributeName: customerId, AttributeType: S }
         - { AttributeName: email, AttributeType: S }
@@ -212,7 +220,8 @@ Resources:
       SSESpecification:
         SSEEnabled: true
         SSEType: KMS
-        KMSMasterKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+        KMSMasterKeyId:
+          !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   # =====================================================================
   # Deploy-time helper Lambda for the custom resources
@@ -251,7 +260,13 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: [dynamodb:PutItem, dynamodb:CreateBackup, dynamodb:UpdateTable, dynamodb:DescribeTable]
+                Action:
+                  [
+                    dynamodb:PutItem,
+                    dynamodb:CreateBackup,
+                    dynamodb:UpdateTable,
+                    dynamodb:DescribeTable,
+                  ]
                 Resource: !GetAtt CustomersTable.Arn
               - Effect: Allow
                 Action: dynamodb:DeleteBackup
@@ -266,15 +281,25 @@ Resources:
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
               - Sid: UseCmkViaDynamoDb
                 Effect: Allow
-                Action: [kms:Encrypt, kms:Decrypt, kms:ReEncrypt*, kms:GenerateDataKey*, kms:DescribeKey, kms:CreateGrant]
-                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Action:
+                  [
+                    kms:Encrypt,
+                    kms:Decrypt,
+                    kms:ReEncrypt*,
+                    kms:GenerateDataKey*,
+                    kms:DescribeKey,
+                    kms:CreateGrant,
+                  ]
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
                 Condition:
                   StringEquals:
                     kms:ViaService: !Sub "dynamodb.${AWS::Region}.amazonaws.com"
               - Sid: DecryptEnvVars
                 Effect: Allow
                 Action: kms:Decrypt
-                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   DeployHelperLogGroup:
     Type: AWS::Logs::LogGroup
@@ -501,7 +526,7 @@ Resources:
       ServiceToken: !GetAtt DeployHelperFn.Arn
       ServiceTimeout: 300
       TableName: !Ref CustomersTable
-      SeedVersion: "1"                 # bump to re-run (existing IDs are never overwritten)
+      SeedVersion: "1" # bump to re-run (existing IDs are never overwritten)
 
   # Deletes the runtime's service-created log group (/aws/bedrock-agentcore/runtimes/<name>-*)
   # after the runtime itself is deleted. It also supplies the runtime name (GetAtt RuntimeName).
@@ -527,7 +552,7 @@ Resources:
       ServiceToken: !GetAtt DeployHelperFn.Arn
       ServiceTimeout: 300
       TableName: !Ref CustomersTable
-      BackupVersion: "1"               # bump to take another on-demand backup
+      BackupVersion: "1" # bump to take another on-demand backup
 
   # =====================================================================
   # Customer API Lambda (DynamoDB CRUD)
@@ -562,21 +587,37 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Scan, dynamodb:Query]
+                Action:
+                  [
+                    dynamodb:GetItem,
+                    dynamodb:PutItem,
+                    dynamodb:Scan,
+                    dynamodb:Query,
+                  ]
                 Resource:
                   - !GetAtt CustomersTable.Arn
                   - !Sub "${CustomersTable.Arn}/index/*"
               - Sid: UseCmkViaDynamoDb
                 Effect: Allow
-                Action: [kms:Encrypt, kms:Decrypt, kms:ReEncrypt*, kms:GenerateDataKey*, kms:DescribeKey, kms:CreateGrant]
-                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Action:
+                  [
+                    kms:Encrypt,
+                    kms:Decrypt,
+                    kms:ReEncrypt*,
+                    kms:GenerateDataKey*,
+                    kms:DescribeKey,
+                    kms:CreateGrant,
+                  ]
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
                 Condition:
                   StringEquals:
                     kms:ViaService: !Sub "dynamodb.${AWS::Region}.amazonaws.com"
               - Sid: DecryptEnvVars
                 Effect: Allow
                 Action: kms:Decrypt
-                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   CustomerApiFnLogGroup:
     Type: AWS::Logs::LogGroup
@@ -758,7 +799,8 @@ Resources:
           # (the tool Lambda role). With AWS_IAM auth every request must be SigV4-signed.
           - Sid: AllowIamPrincipalsInThisAccount
             Effect: Allow
-            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Principal:
+              { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
             Action: execute-api:Invoke
             Resource: execute-api:/*
           - Sid: OnlyThroughTheVpcEndpoint
@@ -911,7 +953,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
         - Key: ApplyCommonWaf
-          Value: "true"   # literal on purpose (the org hook needs a literal true/false, not !Ref)
+          Value: "true" # literal on purpose (the org hook needs a literal true/false, not !Ref)
       RestApiId: !Ref CustomerApi
       DeploymentId: !Ref ApiDeployment
       StageName: !Ref StageName
@@ -974,7 +1016,8 @@ Resources:
               - Sid: DecryptEnvVars
                 Effect: Allow
                 Action: kms:Decrypt
-                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+                Resource:
+                  !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   ToolFnLogGroup:
     Type: AWS::Logs::LogGroup
@@ -1030,7 +1073,7 @@ Resources:
           # associated execute-api endpoint even when that endpoint is shared from another account
           # and has private DNS disabled (the plain {api-id}.execute-api name then returns 403 Forbidden).
           API_BASE_URL: !Sub "https://${CustomerApi}-${ExecuteApiVpceId}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
-          LOG_LEVEL: INFO              # DEBUG adds botocore wire-level logs
+          LOG_LEVEL: INFO # DEBUG adds botocore wire-level logs
       Code:
         ZipFile: |
           import ipaddress, json, logging, os, socket, threading, time, urllib.request, urllib.error, urllib.parse
@@ -1229,8 +1272,15 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Action: [kms:DescribeKey, kms:Decrypt, kms:GenerateDataKey, kms:CreateGrant]
-            Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+            Action:
+              [
+                kms:DescribeKey,
+                kms:Decrypt,
+                kms:GenerateDataKey,
+                kms:CreateGrant,
+              ]
+            Resource:
+              !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   McpGateway:
     Type: AWS::BedrockAgentCore::Gateway
@@ -1249,7 +1299,7 @@ Resources:
       AuthorizerType: AWS_IAM
       RoleArn: !GetAtt GatewayRole.Arn
       KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
-      ExceptionLevel: DEBUG   # POC only - remove for anything beyond a POC
+      ExceptionLevel: DEBUG # POC only - remove for anything beyond a POC
 
   CustomerToolsTarget:
     Type: AWS::BedrockAgentCore::GatewayTarget
@@ -1339,7 +1389,8 @@ Resources:
             Statement:
               - Sid: Bedrock
                 Effect: Allow
-                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Action:
+                  [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
                 Resource:
                   - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
                   # System cross-region profiles (us./global.) may be addressed with or without an account ID
@@ -1358,14 +1409,27 @@ Resources:
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${AgentCodeKey}"
               - Sid: Logs
                 Effect: Allow
-                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams, logs:DescribeLogGroups]
+                Action:
+                  [
+                    logs:CreateLogGroup,
+                    logs:CreateLogStream,
+                    logs:PutLogEvents,
+                    logs:DescribeLogStreams,
+                    logs:DescribeLogGroups,
+                  ]
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
               - Sid: Observability
                 Effect: Allow
-                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+                Action:
+                  [
+                    xray:PutTraceSegments,
+                    xray:PutTelemetryRecords,
+                    cloudwatch:PutMetricData,
+                  ]
                 Resource: "*"
                 Condition:
-                  StringEqualsIfExists: { cloudwatch:namespace: bedrock-agentcore }
+                  StringEqualsIfExists:
+                    { cloudwatch:namespace: bedrock-agentcore }
 
   AgentRuntime:
     Type: AWS::BedrockAgentCore::Runtime
