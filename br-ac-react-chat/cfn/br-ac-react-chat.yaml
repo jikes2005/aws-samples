@@ -1,0 +1,1015 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  br-ac-react-chat (single stack, LAB VERSION - no sign-in). React chat UI on ECS Fargate
+  behind an INTERNAL Network Load Balancer (TLS passthrough, self-signed certificate). The
+  browser calls a PRIVATE API Gateway REST API (through the existing execute-api VPC endpoint),
+  which streams to a FastAPI service on ECS through a VPC link and the same NLB. The API
+  calls the existing AgentCore Runtime agent and reads chat history from its AgentCore Memory.
+  Images are built in a SageMaker notebook (build_images.ipynb). Uses an EXISTING VPC,
+  subnets and VPC endpoints.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Existing network }
+        Parameters: [VpcId, PrivateSubnetIds, ClientCidr, ExecuteApiVpceId]
+      - Label: { default: Agent (outputs of the agentcore-poc stack) }
+        Parameters: [AgentRuntimeArn, MemoryId, AgentKmsKeyArn]
+      - Label: { default: Images (printed by build_images.ipynb) }
+        Parameters: [UiImageUri, ApiImageUri, CpuArchitecture]
+      - Label: { default: App settings }
+        Parameters: [StageName, UiDesiredCount, ApiDesiredCount, ExtraTlsNames]
+      - Label: { default: Encryption }
+        Parameters: [ExistingKmsKeyArn]
+      - Label: { default: Required tags }
+        Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
+      - Label: { default: General }
+        Parameters: [ProjectName]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: br-ac-react-chat
+    AllowedPattern: "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+    MinLength: 3
+    MaxLength: 23
+    Description: Lowercase name used for every resource (max 23 characters)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Existing private subnets in 2+ AZs for the internal load balancer and the tasks
+  ClientCidr:
+    Type: String
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    Description: Address range users' browsers come from (corporate network / VPN / VPC), allowed to the UI on 443
+  ExecuteApiVpceId:
+    Type: String
+    AllowedPattern: "^vpce-[0-9a-f]+$"
+    Description: Existing execute-api interface endpoint ID (the private API is pinned to it; browsers call the API through it)
+  AgentRuntimeArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:bedrock-agentcore:.+:runtime/.+$"
+    Description: AgentRuntimeArn output of the agent stack
+  MemoryId:
+    Type: String
+    MinLength: 1
+    Description: MemoryId output of the agent stack
+  AgentKmsKeyArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:kms:.+:key/.+$"
+    Description: KmsKeyArn output of the agent stack (encrypts its memory, which the API reads chat history from)
+  UiImageUri:
+    Type: String
+    AllowedPattern: "^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com(\\.cn)?/[a-z0-9._/-]+:[A-Za-z0-9_.-]+$"
+    Description: The UI image, as printed by build_images.ipynb
+  ApiImageUri:
+    Type: String
+    AllowedPattern: "^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com(\\.cn)?/[a-z0-9._/-]+:[A-Za-z0-9_.-]+$"
+    Description: The API image, as printed by build_images.ipynb
+  CpuArchitecture:
+    Type: String
+    AllowedValues: [ARM64, X86_64]
+    Default: X86_64
+    Description: CPU the images were built for, as printed by build_images.ipynb
+  StageName:
+    Type: String
+    Default: dev
+    AllowedPattern: "^[a-zA-Z0-9_]+$"
+  UiDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+  ApiDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+  ExtraTlsNames:
+    Type: String
+    Default: ""
+    Description: >
+      Optional extra names or IP addresses (comma-separated) users browse the UI by, e.g. the NLB's private
+      IPs. They go into the self-signed certificate and the API's allowed origins. The NLB's DNS name is always included.
+  ExistingKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]{36}$"
+    Description: Leave blank to create a customer managed key for this stack (see README for an existing key's policy)
+
+  # ---- Required tags ----
+  AppCatID:
+    Type: String
+    MinLength: 1
+    Default: 12345
+  ServiceName:
+    Type: String
+    Default: AgentCore POC
+    MinLength: 1
+  SupportTeam:
+    Type: String
+    MinLength: 1
+    Default: "CLOUD"
+  Environment:
+    Type: String
+    Default: dev
+    MinLength: 1
+
+Conditions:
+  CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
+  HasExtraTlsNames: !Not [!Equals [!Ref ExtraTlsNames, ""]]
+
+Resources:
+  # =====================================================================
+  # Customer managed key - log groups and Fargate task ephemeral storage.
+  # Skipped when ExistingKmsKeyArn is set.
+  # =====================================================================
+  KmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateKmsKey
+    DeletionPolicy: Delete             # stack delete schedules key deletion (7-day minimum KMS wait)
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "CMK for the React chat app"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Description: !Sub "${ProjectName} - CMK for data at rest"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+          # Fargate encrypts the tasks' ephemeral storage with this key (cluster setting)
+          - Sid: FargateEphemeralStorageDataKey
+            Effect: Allow
+            Principal: { Service: fargate.amazonaws.com }
+            Action: kms:GenerateDataKeyWithoutPlaintext
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:aws:ecs:clusterAccount: !Ref AWS::AccountId
+                kms:EncryptionContext:aws:ecs:clusterName: !Ref ProjectName
+          - Sid: FargateEphemeralStorageGrant
+            Effect: Allow
+            Principal: { Service: fargate.amazonaws.com }
+            Action: kms:CreateGrant
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:aws:ecs:clusterAccount: !Ref AWS::AccountId
+                kms:EncryptionContext:aws:ecs:clusterName: !Ref ProjectName
+              ForAllValues:StringEquals:
+                kms:GrantOperations: [Decrypt]
+
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateKmsKey
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}"
+      TargetKeyId: !Ref KmsKey
+
+  # =====================================================================
+  # Network (existing VPC) - security groups only
+  # =====================================================================
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat load balancer"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      GroupDescription: !Sub "${ProjectName} internal network load balancer"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ClientCidr
+          Description: Users' browsers to the UI (HTTPS)
+        # Port 8080 (API) has no rule: only API Gateway's VPC link reaches it, and that
+        # PrivateLink traffic isn't checked against these rules (see the NLB setting).
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: 0.0.0.0/0
+          Description: UI tasks and health checks (tasks only accept this SG)
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+          Description: API tasks and health checks (tasks only accept this SG)
+
+  UiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat UI tasks"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      GroupDescription: !Sub "${ProjectName} UI tasks"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          SourceSecurityGroupId: !Ref NlbSecurityGroup
+          Description: Load balancer only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: VPC endpoints (ECR, S3, logs)
+
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat API tasks"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      GroupDescription: !Sub "${ProjectName} API tasks"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref NlbSecurityGroup
+          Description: Load balancer only (API Gateway VPC link)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: VPC endpoints (ECR, S3, logs, bedrock-agentcore)
+
+  # =====================================================================
+  # Internal Network Load Balancer
+  #   443  -> UI tasks (8443), TLS passed straight through - browsers
+  #   8080 -> API tasks (8000), HTTP - API Gateway VPC link only
+  # =====================================================================
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Internal load balancer for the React chat app"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Ref ProjectName
+      Type: network
+      Scheme: internal
+      Subnets: !Ref PrivateSubnetIds
+      SecurityGroups: [!Ref NlbSecurityGroup]       # only settable when the NLB is created
+      # API Gateway's VPC link arrives over PrivateLink from addresses we can't list; don't
+      # filter that traffic with the SG (browsers still only get 443 from ClientCidr).
+      EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic: "off"
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+        - Key: deletion_protection.enabled
+          Value: "false"
+
+  UiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat UI tasks"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-ui"
+      TargetType: ip
+      Protocol: TCP
+      Port: 8443
+      VpcId: !Ref VpcId
+      HealthCheckProtocol: HTTPS                    # NLB health checks don't validate the certificate
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: preserve_client_ip.enabled
+          Value: "false"
+
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat API tasks"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-api"
+      TargetType: ip
+      Protocol: TCP
+      Port: 8000
+      VpcId: !Ref VpcId
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "60"                               # let in-flight streams finish on deploys
+        - Key: preserve_client_ip.enabled
+          Value: "false"
+
+  UiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref UiTargetGroup
+
+  ApiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiTargetGroup
+
+  # =====================================================================
+  # Private REST API: /api/{proxy+} -> VPC link -> NLB:8080 -> API tasks.
+  # Responses stream (ResponseTransferMode STREAM), so agent answers arrive as
+  # they're written and aren't cut off by the 29-second integration timeout.
+  # =====================================================================
+  VpcLink:
+    Type: AWS::ApiGateway::VpcLink
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "VPC link from API Gateway to the React chat NLB"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-vpclink"
+      Description: API Gateway to the chat API on the internal NLB
+      TargetArns: [!Ref LoadBalancer]
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Private REST API for the React chat app"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-api"
+      Description: Chat API for the React UI (lab - no auth)
+      EndpointConfiguration:
+        Types: [PRIVATE]
+        VpcEndpointIds: [!Ref ExecuteApiVpceId]
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          # No authentication in this lab version - anyone who can reach the execute-api
+          # endpoint can call it. The Deny limits it to requests through that endpoint.
+          - Sid: AllowThroughTheVpcEndpoint
+            Effect: Allow
+            Principal: "*"
+            Action: execute-api:Invoke
+            Resource: execute-api:/*
+          - Sid: OnlyThroughTheVpcEndpoint
+            Effect: Deny
+            Principal: "*"
+            Action: execute-api:Invoke
+            Resource: execute-api:/*
+            Condition:
+              StringNotEquals:
+                aws:SourceVpce: !Ref ExecuteApiVpceId
+
+  # API Gateway's own errors (WAF/resource-policy 403s, throttling, 5xx) carry CORS headers
+  # too, so the browser shows the real error instead of a CORS failure.
+  Cors4xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Chat-User'"
+  Cors5xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Chat-User'"
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: api
+
+  ApiProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: "{proxy+}"
+
+  # ANY /api/{proxy+} - every method (incl. the browser's CORS preflight OPTIONS) goes to
+  # the API, which answers CORS itself.
+  ApiProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE                         # lab version - no sign-in
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: ANY
+        ConnectionType: VPC_LINK
+        ConnectionId: !Ref VpcLink
+        Uri: !Sub "http://${LoadBalancer.DNSName}:8080/api/{proxy}"
+        RequestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+        ResponseTransferMode: STREAM
+        PassthroughBehavior: WHEN_NO_MATCH
+
+  # Bump the suffix whenever methods or integrations change - API Gateway only applies
+  # them in a new deployment.
+  ApiDeploymentV1:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ApiProxyMethod, Cors4xx, Cors5xx]
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: br-ac-react-chat API
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Access logs for the React chat API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-api/access"
+      RetentionInDays: 90
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  ApiExecutionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Execution logs for the React chat API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "API-Gateway-Execution-Logs_${RestApi}/${StageName}"
+      RetentionInDays: 14
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  # API Gateway logging needs the account-level CloudWatch role (set once per account and
+  # region - the agent stack's deploy checks it).
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiExecutionLogGroup   # group must exist (with the CMK) before API Gateway writes to it
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Stage of the React chat API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ApplyCommonWaf
+          Value: "true"   # literal on purpose (the org hook needs a literal true/false, not !Ref)
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeploymentV1
+      StageName: !Ref StageName
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod","path":"$context.path","status":"$context.status",
+          "responseLength":"$context.responseLength","responseLatency":"$context.responseLatency",
+          "integrationLatency":"$context.integrationLatency","integrationStatus":"$context.integration.status",
+          "sourceIp":"$context.identity.sourceIp","vpceId":"$context.identity.vpceId",
+          "xrayTraceId":"$context.xrayTraceId",
+          "errorMessage":"$context.error.message","errorType":"$context.error.responseType",
+          "wafResponseCode":"$context.wafResponseCode","webAclArn":"$context.webaclArn"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          LoggingLevel: INFO        # execution logs: resource-policy / integration decisions
+          DataTraceEnabled: false   # no request/response bodies in logs
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 20
+
+  # =====================================================================
+  # ECS Fargate - one cluster, two services (UI and API), private subnets
+  # =====================================================================
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Cluster for the React chat app"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      ClusterName: !Ref ProjectName                  # also in the key policy's Fargate statements
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ManagedStorageConfiguration:
+          FargateEphemeralStorageKmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  UiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the React chat UI"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/ecs/${ProjectName}/ui"
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the React chat API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/ecs/${ProjectName}/api"
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "ECS task execution role - image pull and logs"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ApiTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Chat API role - invokes the agent and reads chat history"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: chat-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeAgent
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Ref AgentRuntimeArn
+                  - !Sub "${AgentRuntimeArn}/*"          # runtime endpoints (DEFAULT)
+              - Sid: ReadChatHistory
+                Effect: Allow
+                Action: [bedrock-agentcore:ListSessions, bedrock-agentcore:ListEvents, bedrock-agentcore:GetEvent]
+                Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/${MemoryId}"
+              - Sid: MemoryCmk
+                Effect: Allow
+                Action: [kms:Decrypt, kms:DescribeKey]
+                Resource: !Ref AgentKmsKeyArn
+
+  UiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat UI task"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Family: !Sub "${ProjectName}-ui"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      Volumes:                                     # writable space; the root filesystem is read-only
+        - Name: run                                # /app/run is declared (VOLUME) and owned by the app user in the image
+        - Name: tmp
+      ContainerDefinitions:
+        - Name: ui
+          Image: !Ref UiImageUri
+          Essential: true
+          User: "10001"
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          MountPoints:
+            - SourceVolume: run
+              ContainerPath: /app/run              # must match the image's VOLUME path to get its owner
+              ReadOnly: false
+            - SourceVolume: tmp
+              ContainerPath: /tmp
+              ReadOnly: false
+          PortMappings:
+            - ContainerPort: 8443
+              Protocol: tcp
+          Environment:
+            - Name: API_BASE_URL                    # served to the browser as /config.json
+              Value: !Sub "https://${RestApi}-${ExecuteApiVpceId}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}"
+            - Name: TLS_HOSTNAMES                   # names in the self-signed certificate
+              Value: !Join [",", [!GetAtt LoadBalancer.DNSName, !Ref ExtraTlsNames]]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref UiLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ui
+
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat API task"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Family: !Sub "${ProjectName}-api"
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ApiTaskRole.Arn
+      Volumes:
+        - Name: run
+        - Name: tmp
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ApiImageUri
+          Essential: true
+          User: "10001"
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          MountPoints:
+            - SourceVolume: run
+              ContainerPath: /app/run
+              ReadOnly: false
+            - SourceVolume: tmp
+              ContainerPath: /tmp
+              ReadOnly: false
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION_NAME
+              Value: !Ref AWS::Region
+            - Name: AGENT_RUNTIME_ARN
+              Value: !Ref AgentRuntimeArn
+            - Name: MEMORY_ID
+              Value: !Ref MemoryId
+            - Name: ALLOWED_ORIGINS                 # browsers may call the API only from the UI's addresses
+              Value: !If
+                - HasExtraTlsNames
+                - !Join
+                  - ""
+                  - - !Sub "https://${LoadBalancer.DNSName},https://"
+                    - !Join [",https://", !Split [",", !Ref ExtraTlsNames]]
+                - !Sub "https://${LoadBalancer.DNSName}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  UiService:
+    Type: AWS::ECS::Service
+    DependsOn: UiListener
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat UI service"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      ServiceName: !Sub "${ProjectName}-ui"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref UiTaskDefinition
+      DesiredCount: !Ref UiDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      EnableExecuteCommand: false
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref UiSecurityGroup]
+      LoadBalancers:
+        - ContainerName: ui
+          ContainerPort: 8443
+          TargetGroupArn: !Ref UiTargetGroup
+
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: ApiListener
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "React chat API service"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      ServiceName: !Sub "${ProjectName}-api"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref ApiTaskDefinition
+      DesiredCount: !Ref ApiDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      EnableExecuteCommand: false
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref ApiSecurityGroup]
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ApiTargetGroup
+
+Outputs:
+  AppUrl:
+    Description: Open this from the corporate network / VPN. Expect a certificate warning (self-signed)
+    Value: !Sub "https://${LoadBalancer.DNSName}/"
+  ApiBaseUrl:
+    Description: The browser calls the API here (through the execute-api VPC endpoint)
+    Value: !Sub "https://${RestApi}-${ExecuteApiVpceId}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}"
+  RestApiId:
+    Value: !Ref RestApi
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  ClusterName:
+    Value: !Ref Cluster
+  UiServiceName:
+    Value: !GetAtt UiService.Name
+  ApiServiceName:
+    Value: !GetAtt ApiService.Name
+  UiLogGroup:
+    Description: Includes the certificate fingerprint printed at each UI task start
+    Value: !Ref UiLogGroup
+  ApiLogGroup:
+    Value: !Ref ApiLogGroup
+  ApiAccessLogGroup:
+    Value: !Ref ApiAccessLogGroup
+  KmsKeyArn:
+    Value: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
