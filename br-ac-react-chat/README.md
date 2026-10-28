@@ -43,7 +43,7 @@ It's a separate application with its own CloudFormation stack (`cfn/br-ac-react-
 |---|---|
 | `cfn/br-ac-react-chat.yaml` | The infrastructure: CMK, security groups, internal NLB (2 listeners), VPC link, private REST API + stage, ECS cluster, UI and API services |
 | `build_images.ipynb` | In a SageMaker notebook: creates the ECR repositories and pull-through cache (AWS CLI), builds the React app with npm, builds and pushes both images, optionally updates the stack |
-| `scripts/deploy.sh` | Reads the agent stack's outputs and deploys or updates the stack with the image URIs |
+| `scripts/deploy.sh`, `scripts/deploy.ps1` | Read the agent stack's outputs and deploy or update the stack with the image URIs (bash / PowerShell) |
 | `ui/web/` | The React app (Vite + TypeScript). `dist/` is a prebuilt copy, used when `BUILD_UI = False` |
 | `ui/server.py` | UI server: serves `dist/` over HTTPS with a self-signed certificate made at start-up, plus `/config.json` (the API address) and `/healthz` |
 | `api/main.py` | The REST API (FastAPI) |
@@ -69,8 +69,8 @@ All routes are under `/api`. The user's name goes in the `X-Chat-User` header.
   - text reaches the browser as the agent writes it;
   - an answer can take up to 15 minutes, instead of being cut off by API Gateway's usual 29-second limit (5-minute idle limit on private APIs).
 - **One NLB, two listeners.** Port 443 serves browsers the UI. Port 8080 is the API, reachable only through API Gateway's VPC link: the NLB's security group has no rule for 8080, and it doesn't filter the VPC link's PrivateLink traffic.
-- **The browser calls API Gateway directly**, not via the UI server. The request then comes from the user's own address, which your org WAF's IP set most likely already allows. From inside the VPC it would come from a VPC address, which the WAF blocked for the agent's API. The cost is CORS: the API only accepts calls from the UI's address (the NLB name plus `ExtraTlsNames`).
-- **The API stage is tagged `ApplyCommonWaf: "true"`**, as your organisation expects. If browsers get a 403 with `WAF_BLOCK` in the access log, their network isn't in the web ACL's IP set.
+- **The browser calls API Gateway directly**, not via the UI server, so the API is used the way any client on your network would use it. The cost is CORS: the API only accepts calls from the UI's address (the NLB name plus `ExtraTlsNames`).
+- **The API stage is tagged `ApplyCommonWaf: "false"`**, so the org's common WAF isn't applied. If the access log still shows `WAF_BLOCK`, Firewall Manager has a web ACL attached anyway - check with `aws wafv2 get-web-acl-for-resource --resource-arn arn:aws:apigateway:<region>::/restapis/<api-id>/stages/<stage>`.
 
 ## Prerequisites
 
@@ -115,7 +115,22 @@ export CPU_ARCHITECTURE=X86_64
 ./scripts/deploy.sh
 ```
 
-Re-running `deploy.sh` without the image variables keeps the current images. **To change the app**, edit `ui/` or `api/` and run the notebook again; step 6 rolls both services onto the new images. After changing the template, use `deploy.sh`.
+Re-running `deploy.sh` without the image variables keeps the current images.
+
+**From Windows (PowerShell):** `scripts/deploy.ps1` does the same with named parameters (AWS CLI v2; Windows PowerShell 5.1 or PowerShell 7). `Get-Help .\scripts\deploy.ps1 -Full` lists them all.
+
+```powershell
+.\scripts\deploy.ps1 -Region ca-central-1 -VpcId vpc-xxxxxxxx -SubnetIds subnet-aaaa,subnet-bbbb `
+    -ClientCidr 10.0.0.0/8 -ExecuteApiVpceId vpce-xxxxxxxx `
+    -UiImageUri 111122223333.dkr.ecr.ca-central-1.amazonaws.com/br-ac-react-chat-ui:v20261028-090000 `
+    -ApiImageUri 111122223333.dkr.ecr.ca-central-1.amazonaws.com/br-ac-react-chat-api:v20261028-090000 `
+    -CpuArchitecture X86_64
+# Optional: -AwsProfile lab -ExtraTlsNames 10.1.2.3,10.1.4.5 -KmsKeyArn arn:aws:kms:... -StageName dev
+#           -AppCatID / -ServiceName / -SupportTeam / -Environment (tags)
+#           -DeleteFailedStack  (deletes a stack left in ROLLBACK_COMPLETE by a failed first create)
+```
+
+If scripts are blocked, run it once with `powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1 ...`. **To change the app**, edit `ui/` or `api/` and run the notebook again; step 6 rolls both services onto the new images. After changing the template, use `deploy.sh`.
 
 ## Opening the app
 
@@ -142,7 +157,7 @@ Open the `AppUrl` output, `https://<project>-<id>.elb.<region>.amazonaws.com/`, 
 | Area | Control |
 |---|---|
 | Access | Internal NLB only; UI on 443 from `ClientCidr`; API port only through API Gateway's VPC link; no public IPs anywhere |
-| API | Private REST API: only through your execute-api endpoint (resource policy); org WAF (`ApplyCommonWaf`); throttling 20 req/s, burst 50; access + execution logs; X-Ray |
+| API | Private REST API: only through your execute-api endpoint (resource policy); org common WAF off (`ApplyCommonWaf: "false"`); throttling 20 req/s, burst 50; access + execution logs; X-Ray |
 | Browser | CORS limited to the UI's addresses; the UI sends a Content-Security-Policy that only allows its own files and the API |
 | Transport | HTTPS browser → UI task (self-signed) and browser → API Gateway (AWS certificate). VPC link → NLB → API task is HTTP inside the VPC |
 | Identity | **None** - a typed name (lab only) |

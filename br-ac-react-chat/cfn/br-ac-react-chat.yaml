@@ -218,7 +218,7 @@ Resources:
           FromPort: 443
           ToPort: 443
           CidrIp: !Ref ClientCidr
-          Description: Users' browsers to the UI (HTTPS)
+          Description: User browsers to the UI (HTTPS)
         # Port 8080 (API) has no rule: only API Gateway's VPC link reaches it, and that
         # PrivateLink traffic isn't checked against these rules (see the NLB setting).
       SecurityGroupEgress:
@@ -609,7 +609,7 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
         - Key: ApplyCommonWaf
-          Value: "true"   # literal on purpose (the org hook needs a literal true/false, not !Ref)
+          Value: "false"   # literal on purpose (the org hook needs a literal true/false, not !Ref)
       RestApiId: !Ref RestApi
       DeploymentId: !Ref ApiDeploymentV1
       StageName: !Ref StageName
