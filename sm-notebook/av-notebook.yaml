@@ -1,19 +1,10 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  SageMaker AI notebook instance "av-notebook" in an existing VPC/subnet,
-  with a custom IAM execution role for broad dev work (CloudFormation, Lambda,
-  Bedrock, Bedrock AgentCore, Cognito, ECS, ECR, and supporting services).
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SageMaker AI notebook instance.
 
 Parameters:
   NotebookName:
     Type: String
     Default: av-notebook
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: Existing VPC to place the notebook in
-  SubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Description: Existing subnet (private subnet with NAT or VPC endpoints recommended)
   InstanceType:
     Type: String
     Default: ml.t3.medium
@@ -37,54 +28,25 @@ Parameters:
     Description: Notebook platform (Amazon Linux 2023, JupyterLab 4)
   DirectInternetAccess:
     Type: String
-    Default: Disabled
+    Default: Enabled
     AllowedValues: [Enabled, Disabled]
-    Description: >
-      Disabled = all traffic goes through your VPC (needs NAT gateway or VPC
-      endpoints to reach AWS APIs/pip). Enabled = SageMaker-managed internet path.
   RootAccess:
     Type: String
     Default: Enabled
     AllowedValues: [Enabled, Disabled]
 
 Resources:
-
-  # ---------------------------------------------------------------------------
-  # Security group for the notebook ENI
-  # ---------------------------------------------------------------------------
-  NotebookSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupName: !Sub '${NotebookName}-sg'
-      GroupDescription: !Sub 'Security group for SageMaker notebook ${NotebookName}'
-      VpcId: !Ref VpcId
-      SecurityGroupEgress:
-        - IpProtocol: '-1'
-          CidrIp: 0.0.0.0/0
-          Description: Allow all outbound
-      Tags:
-        - Key: Name
-          Value: !Sub '${NotebookName}-sg'
-
-  NotebookSecurityGroupSelfIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref NotebookSecurityGroup
-      SourceSecurityGroupId: !Ref NotebookSecurityGroup
-      IpProtocol: '-1'
-      Description: Allow traffic within the same SG
-
   # ---------------------------------------------------------------------------
   # IAM execution role
   # ---------------------------------------------------------------------------
   NotebookExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${NotebookName}-execution-role'
-      Description: !Sub 'Execution role for SageMaker notebook ${NotebookName}'
+      RoleName: !Sub "${NotebookName}-execution-role"
+      Description: !Sub "Execution role for SageMaker notebook ${NotebookName}"
       MaxSessionDuration: 43200
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -96,16 +58,16 @@ Resources:
         # ---- Core application services -------------------------------------
         - PolicyName: AppServicesAccess
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Sid: CloudFormation
                 Effect: Allow
                 Action: cloudformation:*
-                Resource: '*'
+                Resource: "*"
               - Sid: Lambda
                 Effect: Allow
                 Action: lambda:*
-                Resource: '*'
+                Resource: "*"
               - Sid: Bedrock
                 Effect: Allow
                 Action:
@@ -115,14 +77,14 @@ Resources:
                   - aws-marketplace:ViewSubscriptions
                   - aws-marketplace:Subscribe
                   - aws-marketplace:Unsubscribe
-                Resource: '*'
+                Resource: "*"
               - Sid: Cognito
                 Effect: Allow
                 Action:
                   - cognito-idp:*
                   - cognito-identity:*
                   - cognito-sync:*
-                Resource: '*'
+                Resource: "*"
               - Sid: Containers
                 Effect: Allow
                 Action:
@@ -132,7 +94,7 @@ Resources:
                   - application-autoscaling:*
                   - servicediscovery:*
                   - elasticloadbalancing:*
-                Resource: '*'
+                Resource: "*"
               - Sid: ApiAndIntegration
                 Effect: Allow
                 Action:
@@ -143,7 +105,7 @@ Resources:
                   - states:*
                   - sqs:*
                   - sns:*
-                Resource: '*'
+                Resource: "*"
               - Sid: DataAndStorage
                 Effect: Allow
                 Action:
@@ -157,14 +119,14 @@ Resources:
                   - kendra:*
                   - glue:*
                   - athena:*
-                Resource: '*'
+                Resource: "*"
               - Sid: ConfigSecretsKeys
                 Effect: Allow
                 Action:
                   - secretsmanager:*
                   - ssm:*
                   - kms:*
-                Resource: '*'
+                Resource: "*"
               - Sid: ObservabilityAndBuild
                 Effect: Allow
                 Action:
@@ -176,7 +138,7 @@ Resources:
                   - codecommit:*
                   - codeconnections:*
                   - codestar-connections:*
-                Resource: '*'
+                Resource: "*"
               - Sid: Networking
                 Effect: Allow
                 Action:
@@ -198,7 +160,7 @@ Resources:
                   - ec2:ModifyVpcEndpoint
                   - ec2:CreateTags
                   - ec2:DeleteTags
-                Resource: '*'
+                Resource: "*"
               - Sid: StsAndMisc
                 Effect: Allow
                 Action:
@@ -214,12 +176,12 @@ Resources:
                   - cloudfront:*
                   - servicequotas:*
                   - pricing:*
-                Resource: '*'
+                Resource: "*"
 
         # ---- IAM: enough to let CloudFormation/AgentCore create roles -------
         - PolicyName: IamRoleManagement
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Sid: IamReadOnly
                 Effect: Allow
@@ -227,7 +189,7 @@ Resources:
                   - iam:Get*
                   - iam:List*
                   - iam:SimulatePrincipalPolicy
-                Resource: '*'
+                Resource: "*"
               - Sid: ManageRolesAndPolicies
                 Effect: Allow
                 Action:
@@ -256,18 +218,18 @@ Resources:
                   - iam:CreateServiceLinkedRole
                   - iam:DeleteServiceLinkedRole
                 Resource:
-                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
-                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/*'
-                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*"
               - Sid: PassRole
                 Effect: Allow
                 Action: iam:PassRole
-                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
 
         # ---- Guardrails: block account-level / credential-minting actions ---
         - PolicyName: Guardrails
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Sid: DenyDangerousIam
                 Effect: Deny
@@ -285,7 +247,7 @@ Resources:
                   - organizations:*
                   - account:*
                   - aws-portal:*
-                Resource: '*'
+                Resource: "*"
               - Sid: DenyModifyingOwnRole
                 Effect: Deny
                 Action:
@@ -295,10 +257,10 @@ Resources:
                   - iam:DeleteRolePolicy
                   - iam:UpdateAssumeRolePolicy
                   - iam:DeleteRole
-                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NotebookName}-execution-role'
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NotebookName}-execution-role"
       Tags:
         - Key: Name
-          Value: !Sub '${NotebookName}-execution-role'
+          Value: !Sub "${NotebookName}-execution-role"
 
   # ---------------------------------------------------------------------------
   # SageMaker notebook instance
@@ -317,7 +279,7 @@ Resources:
       VolumeSizeInGB: !Ref VolumeSizeGB
       PlatformIdentifier: !Ref PlatformIdentifier
       InstanceMetadataServiceConfiguration:
-        MinimumInstanceMetadataServiceVersion: '2'
+        MinimumInstanceMetadataServiceVersion: "2"
       Tags:
         - Key: Name
           Value: !Ref NotebookName
@@ -326,8 +288,6 @@ Outputs:
   NotebookInstanceName:
     Value: !GetAtt NotebookInstance.NotebookInstanceName
   NotebookConsoleUrl:
-    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/notebook-instances/${NotebookName}'
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/notebook-instances/${NotebookName}"
   ExecutionRoleArn:
     Value: !GetAtt NotebookExecutionRole.Arn
-  SecurityGroupId:
-    Value: !Ref NotebookSecurityGroup

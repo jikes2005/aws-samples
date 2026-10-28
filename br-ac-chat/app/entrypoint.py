@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-CERT_DIR = "/tmp/tls"
+CERT_DIR = os.environ.get("TLS_DIR", "/app/run/tls")   # a writable volume (see Dockerfile)
 CERT, KEY = f"{CERT_DIR}/cert.pem", f"{CERT_DIR}/key.pem"
 
 
@@ -51,7 +51,11 @@ def make_certificate():
             .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
             .sign(key, hashes.SHA256()))
 
-    os.makedirs(CERT_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.makedirs(CERT_DIR, mode=0o700, exist_ok=True)
+    except PermissionError:
+        raise SystemExit(f"Can't create {CERT_DIR} as UID {os.getuid()}. The task definition must mount a volume "
+                         f"at {os.path.dirname(CERT_DIR)} and the image must declare it (VOLUME) owned by this user.")
     with open(KEY, "wb") as f:
         f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                                   serialization.NoEncryption()))
@@ -63,7 +67,14 @@ def make_certificate():
 
 
 if __name__ == "__main__":
+    try:
+        os.makedirs(os.environ.get("TMPDIR", "/app/run/tmp"), exist_ok=True)
+    except OSError:
+        pass   # make_certificate() reports a clear error if the volume isn't writable
     make_certificate()
     # "python -m streamlit": the packages are on PYTHONPATH, not installed with console scripts
+    # developmentMode=false is also in the config file; repeated here so the server starts even
+    # if the config isn't found (Streamlit assumes development mode when it isn't in site-packages).
     os.execv(sys.executable, [sys.executable, "-m", "streamlit", "run", "app.py",
+                              "--global.developmentMode", "false",
                               "--server.sslCertFile", CERT, "--server.sslKeyFile", KEY])

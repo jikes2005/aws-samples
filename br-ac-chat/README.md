@@ -48,7 +48,9 @@ To add Cognito sign-in later, swap the NLB for an ALB with `authenticate-cognito
 | `app/app.py` | The Streamlit app |
 | `app/entrypoint.py` | Makes the self-signed certificate, then starts Streamlit on HTTPS |
 | `app/build_image.ipynb` | In a SageMaker notebook: creates the ECR repository and pull-through cache (AWS CLI), builds and pushes the image, optionally updates the stack |
-| `app/Dockerfile`, `app/requirements.txt`, `app/.streamlit/config.toml` | Container image (Python 3.12 slim, non-root, no `RUN` steps) and Streamlit settings |
+| `app/Dockerfile`, `app/requirements.txt` | Container image (Python 3.12 slim, non-root, no `RUN` steps) |
+| `app/streamlit_config/config.toml` | Streamlit settings. The Dockerfile copies it to `/app/.streamlit/config.toml` (kept under a plain folder name because Jupyter won't create dot-folders) |
+| `app/run/` | Becomes the app's writable volume at `/app/run` (see the Dockerfile) |
 | `scripts/deploy.sh` | Reads the agent stack's outputs and deploys or updates the stack with `IMAGE_URI` |
 
 ## Prerequisites
@@ -124,7 +126,7 @@ Open the `AppUrl` output, `https://internal-br-ac-chat-<id>.elb.<region>.amazona
 | Access | Internal NLB only; 443 from `ClientCidr`; no public IPs anywhere |
 | Transport | HTTPS end to end to the task (self-signed, ECDSA P-256, TLS by Streamlit/uvicorn) |
 | Identity | **None** - a typed name (lab only) |
-| App tasks | Private subnets, ingress from the NLB only, non-root user, read-only root filesystem (`/tmp` is the only writable path) |
+| App tasks | Private subnets, ingress from the NLB only, non-root user, read-only root filesystem (only the `/app/run` and `/tmp` volumes are writable) |
 | App permissions | Invoke this one agent runtime; list sessions/events in this one memory; decrypt with the agent's key |
 | Images | ECR (created by the notebook): KMS-encrypted, immutable tags, scan on push, last 10 kept |
 | Encryption at rest | This stack's CMK: CloudWatch log groups, Fargate task ephemeral storage. ECR: `ECR_KMS_KEY_ARN` or the AWS managed `aws/ecr` key |
@@ -140,6 +142,7 @@ Open the `AppUrl` output, `https://internal-br-ac-chat-<id>.elb.<region>.amazona
 | Notebook: `docker build --platform` is rejected | Old Docker without BuildKit. Set `TARGET_ARCH = "auto"` to build for the notebook's own CPU |
 | Notebook: `AccessDenied` on `create-repository` / `create-pull-through-cache-rule` | The notebook role's ECR permissions (listed at the top of the notebook) |
 | `deploy.sh`: "set IMAGE_URI" | First deploy - run the notebook first and pass the `IMAGE_URI` it printed |
+| Task log: `PermissionError: [Errno 13] Permission denied: '/tmp/tls'` (or "Can't create /app/run/tls") | An image built before the `/app/run` volume fix, or a task definition without the `run` volume. Rebuild with the notebook and deploy the current template with the new `IMAGE_URI` |
 | Tasks stop with `exec format error` | `CpuArchitecture` doesn't match the image. Use the value the notebook printed |
 | `Service` stuck creating; tasks stop with `CannotPullContainerError` | `ecr.api`/`ecr.dkr`/`s3` endpoints or their security groups |
 | Browser times out | `ClientCidr` doesn't cover your address, or no route from your network to the subnets |
@@ -153,6 +156,7 @@ Open the `AppUrl` output, `https://internal-br-ac-chat-<id>.elb.<region>.amazona
 cd app
 pip install -r requirements.txt
 export AWS_REGION_NAME=ca-central-1 AGENT_RUNTIME_ARN=... MEMORY_ID=...
+mkdir -p .streamlit && cp streamlit_config/config.toml .streamlit/   # where Streamlit looks for it
 streamlit run app.py              # plain HTTP on :8501
 # or, as in the container (HTTPS, self-signed):  python entrypoint.py
 ```

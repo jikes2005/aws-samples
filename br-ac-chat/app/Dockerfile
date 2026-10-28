@@ -11,15 +11,23 @@ FROM ${BASE_IMAGE}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/packages \
-    HOME=/tmp
+    HOME=/app/run \
+    TMPDIR=/app/run/tmp \
+    TLS_DIR=/app/run/tls
 
 WORKDIR /app
 COPY packages/ /app/packages/
 COPY app.py entrypoint.py ./
-COPY .streamlit/ .streamlit/
+COPY streamlit_config/config.toml .streamlit/config.toml
 
-# Non-root (numeric UID, so no useradd step). The root filesystem is read-only at runtime;
-# /tmp is a writable volume (the self-signed certificate is written there at start-up).
+# Writable space for the non-root user. The root filesystem is read-only at runtime, and a
+# Fargate bind-mount volume is owned by root (0755) unless the image declares the path with
+# VOLUME - then Fargate copies the directory and its owner from the image. COPY --chown
+# makes /app/run owned by UID 10001 without a RUN step. The certificate goes in /app/run/tls.
+COPY --chown=10001:10001 run/ /app/run/
+VOLUME ["/app/run", "/tmp"]
+
+# Non-root (numeric UID, so no useradd step)
 USER 10001
 
 EXPOSE 8501

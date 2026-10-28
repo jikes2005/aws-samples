@@ -470,7 +470,8 @@ Resources:
         OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
-      Volumes:
+      Volumes:                                     # writable space; the root filesystem is read-only
+        - Name: run                                # /app/run is declared (VOLUME) and owned by the app user in the image
         - Name: tmp
       ContainerDefinitions:
         - Name: app
@@ -480,6 +481,9 @@ Resources:
           ReadonlyRootFilesystem: true
           Privileged: false
           MountPoints:
+            - SourceVolume: run
+              ContainerPath: /app/run              # must match the image's VOLUME path to get its owner
+              ReadOnly: false
             - SourceVolume: tmp
               ContainerPath: /tmp
               ReadOnly: false
