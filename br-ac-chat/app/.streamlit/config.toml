@@ -1,0 +1,26 @@
+[global]
+# Streamlit assumes "development mode" when it isn't under site-packages. In the image it's
+# on PYTHONPATH (/app/packages), so turn that off explicitly or server.port is rejected.
+developmentMode = false
+
+[server]
+headless = true
+address = "0.0.0.0"
+port = 8501
+fileWatcherType = "none"
+runOnSave = false
+maxUploadSize = 1
+# Browsers reach the app directly (TLS passthrough at the NLB), so CORS and XSRF protection stay on.
+enableCORS = true
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = false
+
+[theme]
+base = "light"
+primaryColor = "#0b5cad"

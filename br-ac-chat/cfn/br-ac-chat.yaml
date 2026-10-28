@@ -1,0 +1,564 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  br-ac-chat (single stack, LAB VERSION - no sign-in). Streamlit chat UI on ECS Fargate
+  behind an INTERNAL Network Load Balancer (TCP passthrough; the app serves HTTPS with a
+  self-signed certificate). The app calls an existing AgentCore Runtime agent (the
+  agentcore-poc stack) and reads chat history from its AgentCore Memory. The container
+  image is built in a SageMaker notebook (app/build_image.ipynb), which also creates the ECR
+  repository - this stack only runs the image given in ImageUri. Uses an EXISTING VPC,
+  subnets and VPC endpoints.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Existing network }
+        Parameters: [VpcId, PrivateSubnetIds, ClientCidr]
+      - Label: { default: Agent (outputs of the agentcore-poc stack) }
+        Parameters: [AgentRuntimeArn, MemoryId, AgentKmsKeyArn]
+      - Label: { default: App build and run }
+        Parameters: [ImageUri, CpuArchitecture, DesiredCount, ExtraTlsNames]
+      - Label: { default: Encryption }
+        Parameters: [ExistingKmsKeyArn]
+      - Label: { default: Required tags }
+        Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
+      - Label: { default: General }
+        Parameters: [ProjectName]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: br-ac-chat
+    AllowedPattern: "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+    MinLength: 3
+    MaxLength: 23
+    Description: Lowercase name used for every resource (max 23 characters - it prefixes the pull-through cache name)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Existing private subnets in 2+ AZs for the internal load balancer and the app tasks
+  ClientCidr:
+    Type: String
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    Description: Address range users' browsers come from (corporate network / VPN / VPC), allowed to the load balancer on 443
+  AgentRuntimeArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:bedrock-agentcore:.+:runtime/.+$"
+    Description: AgentRuntimeArn output of the agent stack
+  MemoryId:
+    Type: String
+    MinLength: 1
+    Description: MemoryId output of the agent stack
+  AgentKmsKeyArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:kms:.+:key/.+$"
+    Description: KmsKeyArn output of the agent stack (encrypts its memory, which the app reads chat history from)
+  ImageUri:
+    Type: String
+    AllowedPattern: "^[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com(\\.cn)?/[a-z0-9._/-]+:[A-Za-z0-9_.-]+$"
+    Description: The app image, as printed by build_image.ipynb (<account>.dkr.ecr.<region>.amazonaws.com/br-ac-chat:<tag>)
+  CpuArchitecture:
+    Type: String
+    AllowedValues: [ARM64, X86_64]
+    Default: X86_64
+    Description: CPU the image was built for, as printed by build_image.ipynb (X86_64 on a typical notebook instance)
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+  ExtraTlsNames:
+    Type: String
+    Default: ""
+    Description: >
+      Optional extra names or IP addresses (comma-separated) for the self-signed certificate, e.g. a
+      friendly DNS name or the load balancer's private IPs if you browse by IP. The NLB's DNS name is always included.
+  ExistingKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]{36}$"
+    Description: Leave blank to create a customer managed key for this stack (see README for an existing key's policy)
+
+  # ---- Required tags ----
+  AppCatID:
+    Type: String
+    MinLength: 1
+    Default: 12345
+  ServiceName:
+    Type: String
+    Default: AgentCore POC
+    MinLength: 1
+  SupportTeam:
+    Type: String
+    MinLength: 1
+    Default: "CLOUD"
+  Environment:
+    Type: String
+    Default: dev
+    MinLength: 1
+
+Conditions:
+  CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
+
+Resources:
+  # =====================================================================
+  # Customer managed key - log groups and Fargate task
+  # ephemeral storage. Skipped when ExistingKmsKeyArn is set.
+  # =====================================================================
+  KmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateKmsKey
+    DeletionPolicy: Delete             # stack delete schedules key deletion (7-day minimum KMS wait)
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "CMK for the chat app"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Description: !Sub "${ProjectName} - CMK for data at rest"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+          # Fargate encrypts the tasks' ephemeral storage with this key (cluster setting)
+          - Sid: FargateEphemeralStorageDataKey
+            Effect: Allow
+            Principal: { Service: fargate.amazonaws.com }
+            Action: kms:GenerateDataKeyWithoutPlaintext
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:aws:ecs:clusterAccount: !Ref AWS::AccountId
+                kms:EncryptionContext:aws:ecs:clusterName: !Ref ProjectName
+          - Sid: FargateEphemeralStorageGrant
+            Effect: Allow
+            Principal: { Service: fargate.amazonaws.com }
+            Action: kms:CreateGrant
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:aws:ecs:clusterAccount: !Ref AWS::AccountId
+                kms:EncryptionContext:aws:ecs:clusterName: !Ref ProjectName
+              ForAllValues:StringEquals:
+                kms:GrantOperations: [Decrypt]
+
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateKmsKey
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}"
+      TargetKeyId: !Ref KmsKey
+
+  # =====================================================================
+  # Network (existing VPC) - security groups only
+  # =====================================================================
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Chat app load balancer"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      GroupDescription: !Sub "${ProjectName} internal network load balancer"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ClientCidr
+          Description: Users' browsers (HTTPS)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: 0.0.0.0/0
+          Description: App tasks and health checks (tasks only accept this SG)
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Chat app tasks"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      GroupDescription: !Sub "${ProjectName} app tasks"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          SourceSecurityGroupId: !Ref NlbSecurityGroup
+          Description: Load balancer only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: VPC endpoints (ECR, S3, logs, bedrock-agentcore)
+
+  # =====================================================================
+  # Internal Network Load Balancer - TCP passthrough on 443. TLS is terminated
+  # by the app itself with a self-signed certificate, so no ACM certificate,
+  # domain or hosted zone is needed.
+  # =====================================================================
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Internal load balancer for the chat app"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Ref ProjectName
+      Type: network
+      Scheme: internal
+      Subnets: !Ref PrivateSubnetIds
+      SecurityGroups: [!Ref NlbSecurityGroup]       # only settable when the NLB is created
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+        - Key: deletion_protection.enabled
+          Value: "false"
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Chat app tasks"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-app"
+      TargetType: ip
+      Protocol: TCP
+      Port: 8501
+      VpcId: !Ref VpcId
+      HealthCheckProtocol: HTTPS                    # NLB health checks don't validate the certificate
+      HealthCheckPath: /_stcore/health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: stickiness.enabled                 # a Streamlit session lives in one task
+          Value: "true"
+        - Key: stickiness.type
+          Value: source_ip
+        - Key: preserve_client_ip.enabled         # tasks see the NLB's address, so their SG can reference the NLB SG
+          Value: "false"
+
+  TlsPassthroughListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  # =====================================================================
+  # ECS Fargate service (private subnets, no public IP)
+  # =====================================================================
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Cluster for the chat app"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      ClusterName: !Ref ProjectName                  # also in the key policy's Fargate statements
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ManagedStorageConfiguration:
+          FargateEphemeralStorageKmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Logs for the chat app"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "ECS task execution role - image pull and logs"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: cmk
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Chat app role - invokes the agent and reads chat history"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: chat-app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeAgent
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Ref AgentRuntimeArn
+                  - !Sub "${AgentRuntimeArn}/*"          # runtime endpoints (DEFAULT)
+              - Sid: ReadChatHistory
+                Effect: Allow
+                Action: [bedrock-agentcore:ListSessions, bedrock-agentcore:ListEvents, bedrock-agentcore:GetEvent]
+                Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/${MemoryId}"
+              - Sid: MemoryCmk
+                Effect: Allow
+                Action: [kms:Decrypt, kms:DescribeKey]
+                Resource: !Ref AgentKmsKeyArn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Chat app task"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Family: !Ref ProjectName
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: tmp
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri                 # built and pushed by build_image.ipynb
+          Essential: true
+          User: "10001"
+          ReadonlyRootFilesystem: true
+          Privileged: false
+          MountPoints:
+            - SourceVolume: tmp
+              ContainerPath: /tmp
+              ReadOnly: false
+          PortMappings:
+            - ContainerPort: 8501
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION_NAME
+              Value: !Ref AWS::Region
+            - Name: AGENT_RUNTIME_ARN
+              Value: !Ref AgentRuntimeArn
+            - Name: MEMORY_ID
+              Value: !Ref MemoryId
+            - Name: TLS_HOSTNAMES               # names in the self-signed certificate
+              Value: !Join [",", [!GetAtt LoadBalancer.DNSName, !Ref ExtraTlsNames]]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: TlsPassthroughListener
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "Chat app service"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      ServiceName: !Ref ProjectName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      EnableExecuteCommand: false
+      HealthCheckGracePeriodSeconds: 90
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref AppSecurityGroup]
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8501
+          TargetGroupArn: !Ref AppTargetGroup
+
+Outputs:
+  AppUrl:
+    Description: Open this from the corporate network / VPN. Expect a certificate warning (self-signed)
+    Value: !Sub "https://${LoadBalancer.DNSName}/"
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  ImageUri:
+    Value: !Ref ImageUri
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  AppLogGroup:
+    Description: Includes the certificate fingerprint printed at each task start
+    Value: !Ref AppLogGroup
+  KmsKeyArn:
+    Value: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
