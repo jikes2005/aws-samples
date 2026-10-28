@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import queue
 import re
+import threading
 import uuid
 
 import boto3
@@ -102,6 +104,13 @@ def one_line(value):
 
 @app.entrypoint
 def invoke(payload, context=None):
+    """{"prompt": ..., "actor_id": ...} -> JSON answer.
+    Add "stream": true to get server-sent events instead (used by the chat UI):
+      {"type": "text", "text": ...}  answer text as the model writes it
+      {"type": "tool", "name": ...}  the agent is calling a tool
+      {"type": "done", ...}          same fields as the JSON answer
+      {"type": "error", "error": ...}
+    """
     log.info("Received payload: %s", payload)
 
     if isinstance(payload, str):
@@ -114,8 +123,34 @@ def invoke(payload, context=None):
     actor_id = memory_id_value(payload.get("actor_id") or payload.get("user_id"), "default-user")
     session_id = memory_id_value(getattr(context, "session_id", None) or payload.get("session_id"),
                                  f"session-{uuid.uuid4()}")
-    log.info("Memory: actor=%s session=%s", actor_id, session_id)
+    log.info("Memory: actor=%s session=%s stream=%s", actor_id, session_id, bool(payload.get("stream")))
 
+    if not payload.get("stream"):
+        return run_agent(prompt, actor_id, session_id)
+
+    # Streaming: run the agent in a worker thread and hand its events to the response
+    # as they arrive. The runtime turns each yielded dict into a "data: {...}" SSE line.
+    events = queue.Queue()
+
+    def worker():
+        try:
+            events.put({"type": "done", **run_agent(prompt, actor_id, session_id, emit=events.put)})
+        except Exception as e:
+            log.exception("Agent failed")
+            events.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
+        finally:
+            events.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def stream():
+        while (event := events.get()) is not None:
+            yield event
+
+    return stream()
+
+
+def run_agent(prompt, actor_id, session_id, emit=None):
     memory_config = AgentCoreMemoryConfig(
         memory_id=MEMORY_ID,
         actor_id=actor_id,
@@ -133,8 +168,8 @@ def invoke(payload, context=None):
 
         # The session manager loads earlier turns of this session (short-term memory)
         # and saves each new message back to AgentCore Memory as it is added.
-        agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, tools=tools,
-                      session_manager=memory, callback_handler=None)
+        agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, tools=tools, session_manager=memory,
+                      callback_handler=stream_callback(emit) if emit else None)
         history = len(agent.messages)
         log.info("Short-term memory: %d earlier message(s) restored", history)
 
@@ -149,6 +184,21 @@ def invoke(payload, context=None):
 
     return {"result": str(result), "tools_used": tools_used, "prompt_seen": prompt,
             "actor_id": actor_id, "session_id": session_id, "messages_restored": history}
+
+
+def stream_callback(emit):
+    """Strands callback -> simple events: answer text chunks and one event per tool call."""
+    announced = set()
+
+    def handler(**kwargs):
+        if kwargs.get("data"):
+            emit({"type": "text", "text": kwargs["data"]})
+        tool = kwargs.get("current_tool_use") or {}
+        if tool.get("name") and tool.get("toolUseId") not in announced:
+            announced.add(tool.get("toolUseId"))
+            emit({"type": "tool", "name": tool["name"]})
+
+    return handler
 
 
 def log_long_term_memory(messages):

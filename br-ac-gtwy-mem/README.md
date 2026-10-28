@@ -211,7 +211,7 @@ The account runs a CloudFormation hook that scans **the template itself**, befor
 
 | Hook finding | Fix in the template |
 |---|---|
-| API.31 – stage tagged `ApplyCommonWaf` | Literal `"true"` tag on `ApiStage`. It must be a literal: the hook rejects `!Ref`. To opt out of the common WAF, edit the value to `"false"` |
+| API.31 – stage tagged `ApplyCommonWaf` | Literal `"false"` tag on `ApiStage` (the stage is kept out of the common WAF). It must be a literal: the hook rejects `!Ref` |
 | DDB.14 – deletion protection | `DeletionProtectionEnabled: true` on the table. `TableDeletionGuard` lifts it only when the stack is deleted |
 | Lam.23 – Lambda in a VPC (warning) | The API and tool Lambdas run in the VPC. `deploy-helper` intentionally doesn't (see *Why the deploy helper runs outside the VPC*), so this stays a non-blocking warning for that one function |
 | Required tags | `AppCatID`, `Description`, `ServiceName`, `Support-Team` and `Environment` on every taggable resource (20). `Description` is per resource. The others come from parameters |
@@ -225,7 +225,7 @@ Resources that can't take tags are skipped: custom resources, API methods and re
 | Customer managed KMS key everywhere it's supported | One CMK (rotation on), or bring your own via `ExistingKmsKeyArn`. See coverage below | CKV_AWS_119, 158, 173, 7 |
 | DynamoDB encrypted with the CMK | `SSEType: KMS` + `KMSMasterKeyId` | CKV_AWS_119 |
 | On-demand backup configured | `dynamodbbackup: "True"` tag (org backup policy), PITR, and a native DynamoDB on-demand backup taken at deploy (`Custom::DynamoDbOnDemandBackup`). The stack has no AWS Backup vault or plan of its own | CKV_AWS_28 |
-| API stage tagged `ApplyCommonWaf` | Literal `"true"` on the stage's tags. It's not a parameter, because the org hook needs a literal `true`/`false`. Edit the value to `"false"` to opt the stage out of the common WAF | API.31 |
+| API stage tagged `ApplyCommonWaf` | Literal `"false"` on the stage's tags, so the common WAF isn't applied. It's not a parameter, because the org hook needs a literal `true`/`false` | API.31 |
 | X-Ray tracing on the API stage | `TracingEnabled: true` | CKV_AWS_73 |
 | API Gateway access logging | JSON access logs to a CMK-encrypted log group, 90-day retention | CKV_AWS_76 |
 
@@ -301,6 +301,8 @@ INFO:customer_agent:Tools used: {'customer-tools___list_customers': 1}
 
 **Payload:** the agent accepts `{"prompt": "..."}`, `{"input": "..."}`, `{"message": "..."}` or a plain string. Add `actor_id` to scope memory to a user. It returns `result`, `tools_used`, `prompt_seen`, `actor_id`, `session_id` and `messages_restored`.
 
+**Streaming:** add `"stream": true` and the runtime replies with server-sent events instead: `{"type": "text", "text": ...}` as the answer is written, `{"type": "tool", "name": ...}` when a tool is called, then `{"type": "done", ...}` with the same fields as the JSON reply (or `{"type": "error", ...}`). The chat UI (`br-ac-chat`) uses this.
+
 For Strands, MCP and HTTP internals, set `LOG_LEVEL=DEBUG` in the runtime's environment variables.
 
 **"Runtime initialization time exceeded. Please make sure that initialization completes in 30s"**
@@ -331,7 +333,7 @@ The tool Lambda's log (`/aws/lambda/<project>-customer-tools`) shows each call's
 | `API-Gateway-Execution-Logs_<api-id>/<stage>` | API Gateway's decision trail: IAM/resource-policy evaluation, authorizer, integration. Search it for the request ID |
 
 Common causes of `403 {"message":"Forbidden"}` on this private API:
-- **WAF:** the stage is tagged `ApplyCommonWaf: "true"`, so the org's common web ACL may be attached and blocking. Check with `aws apigateway get-stage --rest-api-id <id> --stage-name dev --query webAclArn`. `wafResponseCode` in the access log confirms it.
+- **WAF:** the stage is tagged `ApplyCommonWaf: "false"`, but if Firewall Manager attached the org's common web ACL earlier it may still be there and blocking (it isn't always removed when the tag changes). Check with `aws apigateway get-stage --rest-api-id <id> --stage-name dev --query webAclArn`. `wafResponseCode` in the access log confirms it.
 - **The stage serves an old deployment:** API Gateway only applies method, auth and resource-policy changes in a new deployment. The template forces one through the deployment resource's logical ID (`ApiDeploymentV2`); bump it whenever you change those. `deploy.sh` also redeploys the stage on every run.
 - **A request that didn't come through `ExecuteApiVpceId`,** or a caller without `execute-api:Invoke`. The execution log names the denying statement.
 
