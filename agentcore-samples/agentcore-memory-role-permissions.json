@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KmsViaAgentCoreMemory",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateGrant",
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKey",
+        "kms:GenerateDataKeyWithoutPlaintext",
+        "kms:ReEncrypt*"
+      ],
+      "Resource": "arn:aws:kms:ca-central-1:123456789012:key/11111111-2222-3333-4444-555555555555",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "bedrock-agentcore.ca-central-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

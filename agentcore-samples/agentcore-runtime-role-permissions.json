@@ -1,0 +1,140 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LogGroupManagement",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DescribeLogStreams",
+        "logs:PutResourcePolicy"
+      ],
+      "Resource": "arn:aws:logs:ca-central-1:123456789012:log-group:/aws/bedrock-agentcore/runtimes/agentcore_poc_agent-*"
+    },
+    {
+      "Sid": "LogGroupDescribe",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "arn:aws:logs:ca-central-1:123456789012:log-group:*"
+    },
+    {
+      "Sid": "LogStreamWrite",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:ca-central-1:123456789012:log-group:/aws/bedrock-agentcore/runtimes/agentcore_poc_agent-*:log-stream:*"
+    },
+    {
+      "Sid": "XRayTracing",
+      "Effect": "Allow",
+      "Action": [
+        "xray:PutTraceSegments",
+        "xray:PutTelemetryRecords",
+        "xray:GetSamplingRules",
+        "xray:GetSamplingTargets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchMetrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "bedrock-agentcore"
+        }
+      }
+    },
+    {
+      "Sid": "WorkloadAccessToken",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:GetWorkloadAccessToken",
+        "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
+      ],
+      "Resource": [
+        "arn:aws:bedrock-agentcore:ca-central-1:123456789012:workload-identity-directory/default",
+        "arn:aws:bedrock-agentcore:ca-central-1:123456789012:workload-identity-directory/default/workload-identity/agentcore_poc_agent-*"
+      ]
+    },
+    {
+      "Sid": "DenyWorkloadAccessTokenForUserId",
+      "Effect": "Deny",
+      "Action": "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:workload-identity-directory/*"
+    },
+    {
+      "Sid": "BedrockInvokeInferenceProfile",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": "arn:aws:bedrock:ca-central-1:123456789012:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    },
+    {
+      "Sid": "BedrockInvokeModelViaProfileOnly",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:ca-central-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+      ],
+      "Condition": {
+        "StringLike": {
+          "bedrock:InferenceProfileArn": "arn:aws:bedrock:ca-central-1:123456789012:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        }
+      }
+    },
+    {
+      "Sid": "MemoryShortTerm",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:CreateEvent",
+        "bedrock-agentcore:GetEvent",
+        "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:DeleteEvent",
+        "bedrock-agentcore:ListSessions",
+        "bedrock-agentcore:ListActors"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:memory/agentcore_poc_memory-AbCdE12345"
+    },
+    {
+      "Sid": "MemoryLongTermRead",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:RetrieveMemoryRecords",
+        "bedrock-agentcore:ListMemoryRecords",
+        "bedrock-agentcore:GetMemoryRecord"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:memory/agentcore_poc_memory-AbCdE12345"
+    },
+    {
+      "Sid": "InvokeGateway",
+      "Effect": "Allow",
+      "Action": "bedrock-agentcore:InvokeGateway",
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:gateway/agentcore-poc-gateway-abcde12345"
+    },
+    {
+      "Sid": "KmsViaAgentCore",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey"
+      ],
+      "Resource": "arn:aws:kms:ca-central-1:123456789012:key/11111111-2222-3333-4444-555555555555",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "bedrock-agentcore.ca-central-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

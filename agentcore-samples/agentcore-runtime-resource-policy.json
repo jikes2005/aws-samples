@@ -1,0 +1,32 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowJwtInvokeFromVpcEndpoint",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "bedrock-agentcore:InvokeAgentRuntime",
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:runtime/agentcore_poc_agent-AbCdE12345",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceVpce": "vpce-0fedcba9876543210"
+        }
+      }
+    },
+    {
+      "Sid": "DenyInvokeOutsideVpcEndpoint",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "bedrock-agentcore:InvokeAgentRuntime",
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:runtime/agentcore_poc_agent-AbCdE12345",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:SourceVpce": "vpce-0fedcba9876543210"
+        },
+        "Bool": {
+          "aws:ViaAWSService": "false"
+        }
+      }
+    }
+  ]
+}

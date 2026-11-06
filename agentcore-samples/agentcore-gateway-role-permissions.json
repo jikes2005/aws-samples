@@ -1,0 +1,63 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeToolLambdas",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": [
+        "arn:aws:lambda:ca-central-1:123456789012:function:agentcore-poc-tool-1",
+        "arn:aws:lambda:ca-central-1:123456789012:function:agentcore-poc-tool-2"
+      ]
+    },
+    {
+      "Sid": "KmsDescribeKey",
+      "Effect": "Allow",
+      "Action": "kms:DescribeKey",
+      "Resource": "arn:aws:kms:ca-central-1:123456789012:key/11111111-2222-3333-4444-555555555555",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "bedrock-agentcore.ca-central-1.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "KmsDecryptForGateway",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "arn:aws:kms:ca-central-1:123456789012:key/11111111-2222-3333-4444-555555555555",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "bedrock-agentcore.ca-central-1.amazonaws.com"
+        },
+        "StringLike": {
+          "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:gateway/agentcore-poc-gateway-*"
+        }
+      }
+    },
+    {
+      "Sid": "KmsCreateGrantForGateway",
+      "Effect": "Allow",
+      "Action": "kms:CreateGrant",
+      "Resource": "arn:aws:kms:ca-central-1:123456789012:key/11111111-2222-3333-4444-555555555555",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "bedrock-agentcore.ca-central-1.amazonaws.com",
+          "kms:GrantConstraintType": "EncryptionContextSubset"
+        },
+        "ForAllValues:StringEquals": {
+          "kms:GrantOperations": [
+            "Decrypt",
+            "GenerateDataKey"
+          ]
+        },
+        "StringLike": {
+          "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:gateway/agentcore-poc-gateway-*"
+        }
+      }
+    }
+  ]
+}

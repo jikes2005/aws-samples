@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowRuntimeRoleToInvokeGateway",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::123456789012:role/agentcore-poc-agentcore-runtime-role"
+      },
+      "Action": "bedrock-agentcore:InvokeGateway",
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:gateway/agentcore-poc-gateway-abcde12345"
+    },
+    {
+      "Sid": "DenyAllOtherPrincipals",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "bedrock-agentcore:InvokeGateway",
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:gateway/agentcore-poc-gateway-abcde12345",
+      "Condition": {
+        "ArnNotEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::123456789012:role/agentcore-poc-agentcore-runtime-role"
+        }
+      }
+    },
+    {
+      "Sid": "DenyOutsideVpcEndpoint",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "bedrock-agentcore:InvokeGateway",
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:gateway/agentcore-poc-gateway-abcde12345",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:SourceVpce": "vpce-0123456789abcdef0"
+        },
+        "Bool": {
+          "aws:ViaAWSService": "false"
+        }
+      }
+    }
+  ]
+}
