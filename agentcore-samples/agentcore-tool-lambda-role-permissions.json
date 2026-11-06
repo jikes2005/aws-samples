@@ -1,0 +1,70 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LambdaLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:ca-central-1:123456789012:log-group:/aws/lambda/agentcore-poc-tool-1",
+        "arn:aws:logs:ca-central-1:123456789012:log-group:/aws/lambda/agentcore-poc-tool-1:log-stream:*"
+      ]
+    },
+    {
+      "Sid": "VpcCreateNetworkInterface",
+      "Effect": "Allow",
+      "Action": "ec2:CreateNetworkInterface",
+      "Resource": [
+        "arn:aws:ec2:ca-central-1:123456789012:subnet/subnet-0aaa1111bbbb22223",
+        "arn:aws:ec2:ca-central-1:123456789012:subnet/subnet-0ccc3333dddd44445",
+        "arn:aws:ec2:ca-central-1:123456789012:security-group/sg-0eee5555ffff66667",
+        "arn:aws:ec2:ca-central-1:123456789012:network-interface/*"
+      ]
+    },
+    {
+      "Sid": "VpcManageNetworkInterface",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DeleteNetworkInterface",
+        "ec2:AssignPrivateIpAddresses",
+        "ec2:UnassignPrivateIpAddresses"
+      ],
+      "Resource": "arn:aws:ec2:ca-central-1:123456789012:network-interface/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:Vpc": "arn:aws:ec2:ca-central-1:123456789012:vpc/vpc-0123456789abcdef0"
+        }
+      }
+    },
+    {
+      "Sid": "VpcDescribeNetworkInterfaces",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSubnets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InvokePrivateApi",
+      "Effect": "Allow",
+      "Action": "execute-api:Invoke",
+      "Resource": "arn:aws:execute-api:ca-central-1:123456789012:a1b2c3d4e5/prod/GET/accounts/*"
+    },
+    {
+      "Sid": "DecryptEnvironmentVariables",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:ca-central-1:123456789012:key/11111111-2222-3333-4444-555555555555",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "lambda.ca-central-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

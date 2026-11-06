@@ -7,7 +7,9 @@
       "Action": "lambda:InvokeFunction",
       "Resource": [
         "arn:aws:lambda:ca-central-1:123456789012:function:agentcore-poc-tool-1",
-        "arn:aws:lambda:ca-central-1:123456789012:function:agentcore-poc-tool-2"
+        "arn:aws:lambda:ca-central-1:123456789012:function:agentcore-poc-tool-1:live",
+        "arn:aws:lambda:ca-central-1:123456789012:function:agentcore-poc-tool-2",
+        "arn:aws:lambda:ca-central-1:123456789012:function:agentcore-poc-tool-2:live"
       ]
     },
     {
