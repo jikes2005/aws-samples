@@ -1,0 +1,77 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowRuntimeRoleMemoryAccess",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::123456789012:role/agentcore-poc-agentcore-runtime-role"
+      },
+      "Action": [
+        "bedrock-agentcore:CreateEvent",
+        "bedrock-agentcore:GetEvent",
+        "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:DeleteEvent",
+        "bedrock-agentcore:ListSessions",
+        "bedrock-agentcore:ListActors",
+        "bedrock-agentcore:RetrieveMemoryRecords",
+        "bedrock-agentcore:ListMemoryRecords",
+        "bedrock-agentcore:GetMemoryRecord"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:memory/agentcore_poc_memory-AbCdE12345"
+    },
+    {
+      "Sid": "DenyAllOtherPrincipals",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "bedrock-agentcore:CreateEvent",
+        "bedrock-agentcore:GetEvent",
+        "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:DeleteEvent",
+        "bedrock-agentcore:ListSessions",
+        "bedrock-agentcore:ListActors",
+        "bedrock-agentcore:RetrieveMemoryRecords",
+        "bedrock-agentcore:ListMemoryRecords",
+        "bedrock-agentcore:GetMemoryRecord",
+        "bedrock-agentcore:DeleteMemoryRecord",
+        "bedrock-agentcore:BatchCreateMemoryRecords",
+        "bedrock-agentcore:BatchUpdateMemoryRecords",
+        "bedrock-agentcore:BatchDeleteMemoryRecords",
+        "bedrock-agentcore:ListMemoryExtractionJobs",
+        "bedrock-agentcore:StartMemoryExtractionJobs"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:memory/agentcore_poc_memory-AbCdE12345",
+      "Condition": {
+        "ArnNotEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::123456789012:role/agentcore-poc-agentcore-runtime-role"
+        }
+      }
+    },
+    {
+      "Sid": "DenyOutsideVpcEndpoint",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "bedrock-agentcore:CreateEvent",
+        "bedrock-agentcore:GetEvent",
+        "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:DeleteEvent",
+        "bedrock-agentcore:ListSessions",
+        "bedrock-agentcore:ListActors",
+        "bedrock-agentcore:RetrieveMemoryRecords",
+        "bedrock-agentcore:ListMemoryRecords",
+        "bedrock-agentcore:GetMemoryRecord"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:ca-central-1:123456789012:memory/agentcore_poc_memory-AbCdE12345",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:SourceVpce": "vpce-0fedcba9876543210"
+        },
+        "Bool": {
+          "aws:ViaAWSService": "false"
+        }
+      }
+    }
+  ]
+}
