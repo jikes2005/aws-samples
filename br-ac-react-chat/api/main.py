@@ -13,6 +13,11 @@ Endpoints (all under /api):
   POST /api/chats/{chat_id}/messages       {"prompt": "..."} -> server-sent events:
        data: {"type": "text", "text": ...} | {"type": "tool", "name": ...}
              | {"type": "done", "toolsUsed": [...]} | {"type": "error", "error": ...}
+
+Tracing: the image starts with ADOT auto-instrumentation (see the Dockerfile), which traces each
+request, the boto3 calls and exports to X-Ray. This module adds user.id / session.id to the spans
+and passes the trace context to InvokeAgentRuntime, so the agent's spans join the same trace.
+Without the OpenTelemetry packages (or with OTEL_SDK_DISABLED=true) it all becomes a no-op.
 """
 import json
 import logging
@@ -27,6 +32,12 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+try:
+    from opentelemetry import baggage, context as otel_context, propagate, trace
+    tracer = trace.get_tracer(os.environ.get("OTEL_SERVICE_NAME", "chat-api"))
+except ImportError:          # tracing packages not installed - run without traces
+    trace = None
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -44,7 +55,7 @@ CHAT_ID = re.compile(r"^chat-[a-zA-Z0-9-]{28,90}$")      # runtime session IDs m
 agentcore = boto3.client("bedrock-agentcore", region_name=REGION,
                          config=Config(read_timeout=300, connect_timeout=10, retries={"total_max_attempts": 1}))
 
-app = FastAPI(title="br-ac-react-chat API", docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title=os.environ.get("OTEL_SERVICE_NAME", "chat-api"), docs_url="/api/docs", openapi_url="/api/openapi.json")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET", "POST", "OPTIONS"],
                    allow_headers=["Content-Type", "X-Chat-User"], max_age=600)
 
@@ -132,6 +143,24 @@ def sse(event):
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+def tag_request(actor, session_id=None):
+    """Adds the chat user and chat ID to the request's server span (no-op without tracing)."""
+    if trace is None:
+        return
+    span = trace.get_current_span()
+    span.set_attribute("user.id", actor)
+    if session_id:
+        span.set_attribute("session.id", session_id)
+
+
+def trace_headers(ctx):
+    """W3C trace headers for InvokeAgentRuntime, so the agent's spans join this trace."""
+    carrier = {}
+    propagate.inject(carrier, context=ctx)
+    names = {"traceparent": "traceParent", "tracestate": "traceState", "baggage": "baggage"}
+    return {names[k]: v for k, v in carrier.items() if k in names and v}
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -140,6 +169,7 @@ def health():
 @app.get("/api/chats")
 def chats(x_chat_user: str = Header(None)):
     actor = actor_id(x_chat_user)
+    tag_request(actor)
     sessions, token = [], None
     while True:
         kwargs = {"memoryId": MEMORY_ID, "actorId": actor, "maxResults": 100}
@@ -162,6 +192,7 @@ def chats(x_chat_user: str = Header(None)):
 @app.get("/api/chats/{chat_id}")
 def chat(chat_id: str, x_chat_user: str = Header(None)):
     actor = actor_id(x_chat_user)
+    tag_request(actor, chat_id)
     return {"id": check_chat_id(chat_id), "messages": load_chat(actor, chat_id)}
 
 
@@ -173,16 +204,37 @@ class NewMessage(BaseModel):
 def send_message(chat_id: str, body: NewMessage, x_chat_user: str = Header(None)):
     actor = actor_id(x_chat_user)
     check_chat_id(chat_id)
+    tag_request(actor, chat_id)
+    # The response body is streamed after this function returns, so keep the request's trace
+    # context (plus session.id / user.id as baggage) for the generator below.
+    ctx = None
+    if trace is not None:
+        ctx = baggage.set_baggage("session.id", chat_id, otel_context.get_current())
+        ctx = baggage.set_baggage("user.id", actor, ctx)
 
     def events():
         started = time.time()
+        span = None
+        if ctx is not None:
+            span = tracer.start_span("chat.turn", context=ctx,
+                                     attributes={"session.id": chat_id, "user.id": actor})
         yield ": stream open\n\n"          # comment line - sends the headers straight away
         try:
-            resp = agentcore.invoke_agent_runtime(
-                agentRuntimeArn=AGENT_RUNTIME_ARN,
-                runtimeSessionId=chat_id,
-                payload=json.dumps({"prompt": body.prompt, "actor_id": actor, "stream": True}).encode(),
-            )
+            extra, token = {}, None
+            if span is not None:
+                span_ctx = trace.set_span_in_context(span, ctx)
+                extra = trace_headers(span_ctx)
+                token = otel_context.attach(span_ctx)   # the boto3 span becomes a child of chat.turn
+            try:
+                resp = agentcore.invoke_agent_runtime(
+                    agentRuntimeArn=AGENT_RUNTIME_ARN,
+                    runtimeSessionId=chat_id,
+                    payload=json.dumps({"prompt": body.prompt, "actor_id": actor, "stream": True}).encode(),
+                    **extra,
+                )
+            finally:
+                if token is not None:
+                    otel_context.detach(token)
             stream = resp["response"]
             if "text/event-stream" not in resp.get("contentType", ""):
                 data = json.loads(stream.read())          # older agent build without streaming
@@ -204,13 +256,20 @@ def send_message(chat_id: str, body: NewMessage, x_chat_user: str = Header(None)
                     yield sse({"type": "tool", "name": event.get("name", "").split("___")[-1]})
                 elif kind == "done":
                     tools = [n.split("___")[-1] for n in event.get("tools_used") or {}]
+                    if span is not None:
+                        span.set_attribute("chat.tools_used", tools)
                     yield sse({"type": "done", "toolsUsed": tools})
                 elif kind == "error" or "error" in event:
                     yield sse({"type": "error", "error": str(event.get("error"))})
         except Exception as e:
             log.exception("Agent call failed (chat %s)", chat_id)
+            if span is not None:
+                span.record_exception(e)
+                span.set_status(trace.Status(trace.StatusCode.ERROR, type(e).__name__))
             yield sse({"type": "error", "error": f"{type(e).__name__}: {e}"})
         finally:
+            if span is not None:
+                span.end()
             log.info("chat=%s user=%s took %.1fs", chat_id, actor, time.time() - started)
 
     return StreamingResponse(events(), media_type="text/event-stream",

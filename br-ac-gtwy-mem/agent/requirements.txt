@@ -3,3 +3,4 @@ strands-agents>=1.10.0,<2
 mcp>=1.23.0
 httpx>=0.28.1,<1
 boto3>=1.40.0
+aws-opentelemetry-distro>=0.18.0   # ADOT: traces for GenAI Observability (EntryPoint runs opentelemetry-instrument)

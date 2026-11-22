@@ -1,6 +1,6 @@
 # br-ac-react-chat
 
-A React chat UI for the customer agent in **agentcore-poc**, with a REST backend:
+A React chat UI for the customer agent in **agentcore-poc** (stack `br-ac-gtwy-mem`), with a REST backend:
 
 - the **React UI** is served by its own ECS container behind an internal Network Load Balancer;
 - the browser calls a **private API Gateway REST API**;
@@ -74,8 +74,8 @@ All routes are under `/api`. The user's name goes in the `X-Chat-User` header.
 
 ## Prerequisites
 
-- **The agent stack** (`agentcore-poc`) deployed with AgentCore Memory and the agent build that streams. `deploy.sh` reads its `AgentRuntimeArn`, `MemoryId` and `KmsKeyArn` outputs.
-- **VPC endpoints**, with security groups allowing 443 from the VPC range (`172.16.0.0/20`): `ecr.api`, `ecr.dkr`, `s3` (gateway), `logs`, `bedrock-agentcore`, and `execute-api` (pass its ID as `EXECUTE_API_VPCE`, as for the agent stack).
+- **The agent stack** (`br-ac-gtwy-mem`, from the agentcore-poc project) deployed with AgentCore Memory and the agent build that streams. `deploy.sh` reads its `AgentRuntimeArn`, `MemoryId` and `KmsKeyArn` outputs.
+- **VPC endpoints**, with security groups allowing 443 from the VPC range (`172.16.0.0/20`): `ecr.api`, `ecr.dkr`, `s3` (gateway), `logs`, `bedrock-agentcore`, `xray` (tracing), and `execute-api` (pass its ID as `EXECUTE_API_VPCE`, as for the agent stack).
 - **Users' browsers must reach:**
   - the NLB on 443 (`CLIENT_CIDR`);
   - the execute-api endpoint through its `<api-id>-<vpce-id>.execute-api...` name.
@@ -107,10 +107,12 @@ export UI_IMAGE_URI=111122223333.dkr.ecr.ca-central-1.amazonaws.com/br-ac-react-
 export API_IMAGE_URI=111122223333.dkr.ecr.ca-central-1.amazonaws.com/br-ac-react-chat-api:v20261028-090000
 export CPU_ARCHITECTURE=X86_64
 # Optional:
-# export AGENT_STACK=agentcore-poc
+# export AGENT_STACK=br-ac-gtwy-mem         # default
 # export EXTRA_TLS_NAMES=10.1.2.3,10.1.4.5    # other names/IPs users browse the UI by (certificate + CORS)
 # export STAGE=dev
 # export KMS_KEY_ARN=arn:aws:kms:...
+# export ENABLE_TRACING=false                 # default true
+# export TRACE_SAMPLING_RATE=0.1              # default 1 = every request
 # Tag values: APP_CAT_ID, SERVICE_NAME, SUPPORT_TEAM, ENVIRONMENT
 ./scripts/deploy.sh
 ```
@@ -126,17 +128,43 @@ Re-running `deploy.sh` without the image variables keeps the current images.
     -ApiImageUri 111122223333.dkr.ecr.ca-central-1.amazonaws.com/br-ac-react-chat-api:v20261028-090000 `
     -CpuArchitecture X86_64
 # Optional: -AwsProfile lab -ExtraTlsNames 10.1.2.3,10.1.4.5 -KmsKeyArn arn:aws:kms:... -StageName dev
+#           -EnableTracing false -TraceSamplingRate 0.1
 #           -AppCatID / -ServiceName / -SupportTeam / -Environment (tags)
 #           -DeleteFailedStack  (deletes a stack left in ROLLBACK_COMPLETE by a failed first create)
 ```
 
 If scripts are blocked, run it once with `powershell -ExecutionPolicy Bypass -File .\scripts\deploy.ps1 ...`. **To change the app**, edit `ui/` or `api/` and run the notebook again; step 6 rolls both services onto the new images. After changing the template, use `deploy.sh`.
 
+## Tracing (end to end)
+
+With `EnableTracing=true` (the default) one chat message is one trace in **CloudWatch → GenAI Observability** and **Application Signals → Transaction Search**:
+
+```
+API Gateway stage (X-Ray)                         sampling decision, X-Amzn-Trace-Id header
+ └─ POST /api/chats/{chat_id}/messages            chat API (FastAPI)   user.id, session.id
+     └─ chat.turn                                 the streamed reply   tools used
+         └─ Bedrock AgentCore.InvokeAgentRuntime  boto3 call, sends traceparent + baggage
+             └─ agent spans (AgentCore Runtime)    agent loop, model calls, tool calls, Memory
+                 └─ Gateway -> tool Lambda -> private API -> API Lambda -> DynamoDB
+```
+
+How the chat API does it:
+- The image includes the ADOT Python distro (`aws-opentelemetry-distro`). `api/Dockerfile` puts OpenTelemetry's `sitecustomize.py` first on `PYTHONPATH`, which does what `opentelemetry-instrument` would: FastAPI and boto3 are instrumented and spans go straight to `https://xray.<region>.amazonaws.com/v1/traces` (SigV4, no collector sidecar). The `OTEL_*` settings are in the task definition.
+- `api/main.py` adds `user.id` and `session.id` (the chat ID, which is also the AgentCore session and Memory session) to the request span, opens a `chat.turn` span for the streamed reply, and passes `traceParent` / `baggage` to `InvokeAgentRuntime` so the agent's spans join the trace.
+- Sampling follows API Gateway's decision. The stack adds an X-Ray sampling rule (`<ProjectName>-all`, rate `TraceSamplingRate`) for the stage, because API Gateway's default rule only samples about 5%.
+- With `EnableTracing=false` the task sets `OTEL_SDK_DISABLED=true`; the code paths become no-ops.
+
+**Needs:** the agent stack deployed with `EnableTracing=true`, Transaction Search on in the account and Region (`agentcore-poc/scripts/enable-transaction-search.sh`, once), and the `xray` VPC endpoint. The task role gets `AWSXrayWriteOnlyAccess`. `deploy.sh` / `deploy.ps1` warn if Transaction Search or the endpoint is missing.
+
+**Finding a user's traces:** Transaction Search → filter on `attributes.user.id = jane-doe` or `attributes.session.id = <chat id>`; the chat ID is in the browser's URL. The UI's own (browser) requests aren't traced.
+
+**Data in spans:** the agent's spans can hold prompts, replies and tool results (customer data). Treat the `aws/spans` log group like the data itself.
+
 ## Opening the app
 
 Open the `AppUrl` output, `https://<project>-<id>.elb.<region>.amazonaws.com/`, from the corporate network or VPN.
 
-- **Certificate warning:** expected, the UI's certificate is self-signed. Choose *Advanced → Continue*. To confirm you're on your app, compare the certificate's SHA-256 fingerprint with the one in `/ecs/br-ac-react-chat/ui`, which is logged when each task starts. A new task makes a new certificate.
+- **Certificate warning:** expected, the UI's certificate is self-signed. Choose *Advanced → Continue*. To confirm you're on your app, compare the certificate's SHA-256 fingerprint with the one in `/<ProjectName>/ecs/ui`, which is logged when each task starts. A new task makes a new certificate.
 - **The NLB name doesn't resolve:** browse by the NLB's private IP instead, and add those IPs to `EXTRA_TLS_NAMES` (they go in the certificate and the API's allowed origins), then run `deploy.sh`. To find the IPs:
   ```bash
   aws ec2 describe-network-interfaces --filters "Name=description,Values=ELB net/br-ac-react-chat/*" \
@@ -167,16 +195,28 @@ Open the `AppUrl` output, `https://<project>-<id>.elb.<region>.amazonaws.com/`, 
 
 **Using an existing CMK (`KMS_KEY_ARN`):** its key policy needs the account-root statement, the CloudWatch Logs statement and the two `fargate.amazonaws.com` statements from `KmsKey` in the template (cluster name = `ProjectName`).
 
+## Log groups
+
+Named `/<ProjectName>/<component>/...` (`ProjectName` parameter, default `br-ac-react-chat`), CMK-encrypted, tagged and deleted with the stack:
+
+| Log group | What writes to it |
+|---|---|
+| `/<ProjectName>/ecs/ui` | UI tasks (also the certificate fingerprint at start-up) |
+| `/<ProjectName>/ecs/api` | API tasks (FastAPI) |
+| `/<ProjectName>/apigateway/access` | API Gateway access log |
+
+`API-Gateway-Execution-Logs_<api-id>/<stage>` keeps the name API Gateway gives it.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
 | Banner "Can't reach the API" | The browser can't resolve or reach `<api-id>-<vpce-id>.execute-api...` (DNS or route to the endpoint), or the browser blocked it for CORS (the page's address isn't in the API's allowed origins - add it to `EXTRA_TLS_NAMES`) |
-| Banner "The API refused the request (403)" | Check `/aws/apigateway/br-ac-react-chat-api/access`: `wafResponseCode: WAF_BLOCK` = the org WAF's IP set doesn't include the browser's network; otherwise the request didn't come through `EXECUTE_API_VPCE` |
-| API calls return 500/504 | VPC link or API tasks. Check the access log's `integrationStatus` and `errorMessage`, the target group health, and `/ecs/br-ac-react-chat/api` |
+| Banner "The API refused the request (403)" | Check `/<ProjectName>/apigateway/access`: `wafResponseCode: WAF_BLOCK` = the org WAF's IP set doesn't include the browser's network; otherwise the request didn't come through `EXECUTE_API_VPCE` |
+| API calls return 500/504 | VPC link or API tasks. Check the access log's `integrationStatus` and `errorMessage`, the target group health, and `/<ProjectName>/ecs/api` |
 | `VpcLink` stuck or failed | The NLB must exist in this account and region; VPC links take a few minutes |
 | Answers arrive all at once | Something between the browser and API Gateway is buffering (a proxy). The API sends events as they come |
-| "Sorry, something went wrong calling the agent" | `/ecs/br-ac-react-chat/api` has the error; the agent's runtime log has the details |
+| "Sorry, something went wrong calling the agent" | `/<ProjectName>/ecs/api` has the error; the agent's runtime log has the details |
 | Notebook: `npm ci` fails | No npm registry access, or Node.js older than 20. Set `BUILD_UI = False` to use the prebuilt `dist/` |
 | Notebook: `docker build` can't pull the base image | `ecr.api`/`ecr.dkr`/`s3` endpoints, or the role lacks `CreateRepository`/`BatchImportUpstreamImage` on `repository/br-ac-react-chat-public/*` |
 | Tasks stop with `exec format error` | `CPU_ARCHITECTURE` doesn't match the images - use the value the notebook printed |

@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import os
@@ -141,7 +142,9 @@ def invoke(payload, context=None):
         finally:
             events.put(None)
 
-    threading.Thread(target=worker, daemon=True).start()
+    # copy_context: the worker thread keeps the request's OpenTelemetry trace context, so the
+    # agent's spans (model, tools, memory) join the invocation's trace instead of starting new ones
+    threading.Thread(target=contextvars.copy_context().run, args=(worker,), daemon=True).start()
 
     def stream():
         while (event := events.get()) is not None:
@@ -169,6 +172,8 @@ def run_agent(prompt, actor_id, session_id, emit=None):
         # The session manager loads earlier turns of this session (short-term memory)
         # and saves each new message back to AgentCore Memory as it is added.
         agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, tools=tools, session_manager=memory,
+                      # added to every span Strands emits, so traces can be searched by user and chat
+                      trace_attributes={"session.id": session_id, "user.id": actor_id},
                       callback_handler=stream_callback(emit) if emit else None)
         history = len(agent.messages)
         log.info("Short-term memory: %d earlier message(s) restored", history)

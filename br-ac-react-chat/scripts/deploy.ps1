@@ -49,12 +49,14 @@ param(
     [string]   $Region = $(if ($env:AWS_REGION) { $env:AWS_REGION } else { "ca-central-1" }),
     [string]   $AwsProfile = "",                           # AWS CLI profile; blank = default credentials
     [string]   $StackName = "br-ac-react-chat",            # also the ProjectName parameter (max 23 chars)
-    [string]   $AgentStackName = "agentcore-poc",
+    [string]   $AgentStackName = "br-ac-gtwy-mem",
     [string]   $StageName = "dev",
     [string[]] $ExtraTlsNames = @(),                       # other names/IPs users browse the UI by
     [string]   $KmsKeyArn = "",                            # existing CMK; blank = the stack creates one
     [ValidateRange(0, 10)] [int] $UiDesiredCount = 1,
     [ValidateRange(0, 10)] [int] $ApiDesiredCount = 1,
+    [ValidateSet("true", "false")] [string] $EnableTracing = "true",   # ADOT traces to X-Ray / GenAI Observability
+    [ValidateRange(0.0, 1.0)] [double] $TraceSamplingRate = 1,         # share of requests traced
     [string]   $TemplateFile = (Join-Path $PSScriptRoot "..\cfn\br-ac-react-chat.yaml"),
 
     # ---- Required tags (defaults match the template) ----
@@ -119,6 +121,17 @@ if (-not $agentRuntimeArn -or -not $memoryId -or -not $agentKmsKeyArn) {
 }
 Write-Host "    runtime: $agentRuntimeArn"
 Write-Host "    memory : $memoryId"
+if ($EnableTracing -eq "true") {
+    $dest = Test-Aws xray get-trace-segment-destination --query Destination --output text
+    if (-not $dest -or "$dest".Trim() -ne "CloudWatchLogs") {
+        Write-Warning "Transaction Search is off in $Region - no traces until it's on (agentcore-poc\scripts\enable-transaction-search.ps1)"
+    }
+    $xrayVpce = Test-Aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VpcId" "Name=service-name,Values=com.amazonaws.$Region.xray" `
+        --query "length(VpcEndpoints[?State=='available'])" --output text
+    if ($xrayVpce -and "$xrayVpce".Trim() -eq "0") {
+        Write-Warning "No xray VPC endpoint in $VpcId - the chat API can't send spans"
+    }
+}
 
 $status = Test-Aws cloudformation describe-stacks --stack-name $StackName --query "Stacks[0].StackStatus" --output text
 $status = if ($status) { ($status | Out-String).Trim() } else { "" }
@@ -146,6 +159,8 @@ $overrides = @(
     "ExistingKmsKeyArn=$KmsKeyArn",
     "UiDesiredCount=$UiDesiredCount",
     "ApiDesiredCount=$ApiDesiredCount",
+    "EnableTracing=$EnableTracing",
+    "TraceSamplingRate=$([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $TraceSamplingRate))",
     "AppCatID=$AppCatID",
     "ServiceName=$ServiceName",
     "SupportTeam=$SupportTeam",

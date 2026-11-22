@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  br-ac-react-chat (single stack, LAB VERSION - no sign-in). React chat UI on ECS Fargate
+  React chat app (single stack, LAB VERSION - no sign-in). React chat UI on ECS Fargate
   behind an INTERNAL Network Load Balancer (TLS passthrough, self-signed certificate). The
   browser calls a PRIVATE API Gateway REST API (through the existing execute-api VPC endpoint),
   which streams to a FastAPI service on ECS through a VPC link and the same NLB. The API
@@ -13,12 +13,14 @@ Metadata:
     ParameterGroups:
       - Label: { default: Existing network }
         Parameters: [VpcId, PrivateSubnetIds, ClientCidr, ExecuteApiVpceId]
-      - Label: { default: Agent (outputs of the agentcore-poc stack) }
+      - Label: { default: Agent (outputs of the agent stack) }
         Parameters: [AgentRuntimeArn, MemoryId, AgentKmsKeyArn]
       - Label: { default: Images (printed by build_images.ipynb) }
         Parameters: [UiImageUri, ApiImageUri, CpuArchitecture]
       - Label: { default: App settings }
         Parameters: [StageName, UiDesiredCount, ApiDesiredCount, ExtraTlsNames]
+      - Label: { default: Tracing (GenAI Observability) }
+        Parameters: [EnableTracing, TraceSamplingRate]
       - Label: { default: Encryption }
         Parameters: [ExistingKmsKeyArn]
       - Label: { default: Required tags }
@@ -92,6 +94,19 @@ Parameters:
     Description: >
       Optional extra names or IP addresses (comma-separated) users browse the UI by, e.g. the NLB's private
       IPs. They go into the self-signed certificate and the API's allowed origins. The NLB's DNS name is always included.
+  EnableTracing:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Send OpenTelemetry traces from the chat API to X-Ray (needs Transaction Search on in the account
+      and an xray VPC endpoint - see README). The agent's spans join the same trace.
+  TraceSamplingRate:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 1
+    Description: Share of chat requests traced (0-1). 1 traces every request (POC).
   ExistingKmsKeyArn:
     Type: String
     Default: ""
@@ -119,6 +134,7 @@ Parameters:
 Conditions:
   CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
   HasExtraTlsNames: !Not [!Equals [!Ref ExtraTlsNames, ""]]
+  TracingOn: !Equals [!Ref EnableTracing, "true"]
 
 Resources:
   # =====================================================================
@@ -543,7 +559,7 @@ Resources:
     DependsOn: [ApiProxyMethod, Cors4xx, Cors5xx]
     Properties:
       RestApiId: !Ref RestApi
-      Description: br-ac-react-chat API
+      Description: !Sub "${ProjectName} API"
 
   ApiAccessLogGroup:
     Type: AWS::Logs::LogGroup
@@ -563,7 +579,7 @@ Resources:
           Value: !Ref Environment
         - Key: Project
           Value: !Ref ProjectName
-      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-api/access"
+      LogGroupName: !Sub "/${ProjectName}/apigateway/access"
       RetentionInDays: 90
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
@@ -634,6 +650,38 @@ Resources:
           ThrottlingBurstLimit: 50
           ThrottlingRateLimit: 20
 
+  # API Gateway samples X-Ray traces itself (default ~5%) and the chat API follows its decision,
+  # so this rule sets the rate for the API stage (service name "<api name>/<stage>").
+  TraceSamplingRule:
+    Type: AWS::XRay::SamplingRule
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "X-Ray sampling for the chat API"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      SamplingRule:
+        RuleName: !Sub "${ProjectName}-all"
+        Priority: 100
+        FixedRate: !Ref TraceSamplingRate
+        ReservoirSize: 10
+        ServiceName: !Sub "${ProjectName}-*"
+        ServiceType: "*"
+        Host: "*"
+        HTTPMethod: "*"
+        URLPath: "*"
+        ResourceARN: "*"
+        Version: 1
+
   # =====================================================================
   # ECS Fargate - one cluster, two services (UI and API), private subnets
   # =====================================================================
@@ -679,7 +727,7 @@ Resources:
           Value: !Ref Environment
         - Key: Project
           Value: !Ref ProjectName
-      LogGroupName: !Sub "/ecs/${ProjectName}/ui"
+      LogGroupName: !Sub "/${ProjectName}/ecs/ui"
       RetentionInDays: 30
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
@@ -701,7 +749,7 @@ Resources:
           Value: !Ref Environment
         - Key: Project
           Value: !Ref ProjectName
-      LogGroupName: !Sub "/ecs/${ProjectName}/api"
+      LogGroupName: !Sub "/${ProjectName}/ecs/api"
       RetentionInDays: 30
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
@@ -756,6 +804,8 @@ Resources:
             Action: sts:AssumeRole
             Condition:
               StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - !If [TracingOn, !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSXrayWriteOnlyAccess", !Ref AWS::NoValue]
       Policies:
         - PolicyName: chat-api
           PolicyDocument:
@@ -886,6 +936,35 @@ Resources:
               Value: !Ref AgentRuntimeArn
             - Name: MEMORY_ID
               Value: !Ref MemoryId
+            # ---- Tracing: ADOT (loaded by the image's sitecustomize) sends spans straight to X-Ray ----
+            - Name: OTEL_SDK_DISABLED
+              Value: !If [TracingOn, "false", "true"]
+            - Name: OTEL_PYTHON_DISTRO
+              Value: aws_distro
+            - Name: OTEL_PYTHON_CONFIGURATOR
+              Value: aws_configurator
+            - Name: OTEL_SERVICE_NAME
+              Value: !Sub "${ProjectName}-api"
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: !Sub "deployment.environment=${Environment}"
+            - Name: OTEL_TRACES_EXPORTER
+              Value: otlp
+            - Name: OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
+              Value: http/protobuf
+            - Name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT     # SigV4-signed by ADOT; needs the xray VPC endpoint
+              Value: !Sub "https://xray.${AWS::Region}.amazonaws.com/v1/traces"
+            - Name: OTEL_METRICS_EXPORTER
+              Value: none
+            - Name: OTEL_LOGS_EXPORTER
+              Value: none
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_ENABLED
+              Value: "false"
+            - Name: OTEL_TRACES_SAMPLER                   # follow API Gateway's decision when it sends one
+              Value: parentbased_traceidratio
+            - Name: OTEL_TRACES_SAMPLER_ARG
+              Value: !Ref TraceSamplingRate
+            - Name: OTEL_PYTHON_EXCLUDED_URLS             # no spans for the NLB / container health checks
+              Value: "api/health"
             - Name: ALLOWED_ORIGINS                 # browsers may call the API only from the UI's addresses
               Value: !If
                 - HasExtraTlsNames

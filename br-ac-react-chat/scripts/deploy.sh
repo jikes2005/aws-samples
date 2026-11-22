@@ -8,7 +8,7 @@
 set -euo pipefail
 
 PROJECT="${PROJECT:-br-ac-react-chat}"
-AGENT_STACK="${AGENT_STACK:-agentcore-poc}"
+AGENT_STACK="${AGENT_STACK:-br-ac-gtwy-mem}"
 REGION="${AWS_REGION:-ca-central-1}"
 VPC_ID="${VPC_ID:?set VPC_ID}"
 SUBNET_IDS="${SUBNET_IDS:?set SUBNET_IDS, comma-separated private subnets in 2+ AZs}"
@@ -20,6 +20,8 @@ CPU_ARCHITECTURE="${CPU_ARCHITECTURE:-}"    # X86_64 or ARM64, from build_images
 STAGE="${STAGE:-dev}"
 EXTRA_TLS_NAMES="${EXTRA_TLS_NAMES:-}"      # optional extra names/IPs users browse the UI by, comma-separated
 KMS_KEY_ARN="${KMS_KEY_ARN:-}"              # blank = stack creates its own CMK
+ENABLE_TRACING="${ENABLE_TRACING:-true}"    # ADOT traces from the chat API to X-Ray / GenAI Observability
+TRACE_SAMPLING_RATE="${TRACE_SAMPLING_RATE:-1}"   # 0-1; 1 = every request (POC)
 # Required tags (defaults match the template)
 APP_CAT_ID="${APP_CAT_ID:-12345}"
 SUPPORT_TEAM="${SUPPORT_TEAM:-CLOUD}"
@@ -50,6 +52,14 @@ for v in AGENT_RUNTIME_ARN MEMORY_ID AGENT_KMS_KEY_ARN; do
 done
 echo "    runtime: $AGENT_RUNTIME_ARN"
 echo "    memory : $MEMORY_ID"
+if [[ "$ENABLE_TRACING" == "true" ]]; then
+  DEST=$(aws xray get-trace-segment-destination --region "$REGION" --query Destination --output text 2>/dev/null || echo unknown)
+  [[ "$DEST" == "CloudWatchLogs" ]] || echo "WARNING: Transaction Search is off in $REGION - no traces until it's on (agentcore-poc/scripts/enable-transaction-search.sh)"
+  XRAY_VPCE=$(aws ec2 describe-vpc-endpoints --region "$REGION" \
+    --filters Name=vpc-id,Values="$VPC_ID" Name=service-name,Values="com.amazonaws.$REGION.xray" \
+    --query "VpcEndpoints[?State=='available'] | length(@)" --output text 2>/dev/null || echo "?")
+  [[ "$XRAY_VPCE" != "0" ]] || echo "WARNING: no xray VPC endpoint in $VPC_ID - the chat API can't send spans"
+fi
 
 IMAGE_PARAMS=()
 if [[ -n "$UI_IMAGE_URI" || -n "$API_IMAGE_URI" ]]; then
@@ -68,7 +78,7 @@ aws cloudformation deploy --region "$REGION" \
     VpcId="$VPC_ID" PrivateSubnetIds="$SUBNET_IDS" ClientCidr="$CLIENT_CIDR" ExecuteApiVpceId="$EXECUTE_API_VPCE" \
     AgentRuntimeArn="$AGENT_RUNTIME_ARN" MemoryId="$MEMORY_ID" AgentKmsKeyArn="$AGENT_KMS_KEY_ARN" \
     ExtraTlsNames="$EXTRA_TLS_NAMES" ${IMAGE_PARAMS[@]+"${IMAGE_PARAMS[@]}"} \
-    ExistingKmsKeyArn="$KMS_KEY_ARN" \
+    ExistingKmsKeyArn="$KMS_KEY_ARN" EnableTracing="$ENABLE_TRACING" TraceSamplingRate="$TRACE_SAMPLING_RATE" \
     AppCatID="$APP_CAT_ID" SupportTeam="$SUPPORT_TEAM" ServiceName="$SERVICE_NAME" Environment="$ENVIRONMENT" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
 

@@ -17,6 +17,8 @@ Metadata:
         Parameters: [ArtifactBucket, AgentCodeKey, ModelId, MemoryEventExpiryDays]
       - Label: { default: "Encryption, backup and API controls" }
         Parameters: [ExistingKmsKeyArn, CreateApiGatewayAccountRole]
+      - Label: { default: Tracing (GenAI Observability) }
+        Parameters: [EnableTracing, TraceSamplingRate, AdotLambdaLayerArn]
       - Label: { default: Required tags }
         Parameters: [AppCatID, ServiceName, SupportTeam, Environment]
       - Label: { default: General }
@@ -25,7 +27,7 @@ Metadata:
 Parameters:
   ProjectName:
     Type: String
-    Default: agentcore-poc
+    Default: br-ac-gtwy-mem
     AllowedPattern: "^[a-z][a-z0-9-]{2,29}$"
   StageName:
     Type: String
@@ -62,6 +64,26 @@ Parameters:
     Description: >
       Leave blank to create a customer managed key for this stack. To use an existing CMK,
       give its key ARN (not an alias) and add the key policy statements from the README.
+  EnableTracing:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      OpenTelemetry (ADOT) traces for the agent, tool Lambda and customer API Lambda, plus Gateway and Memory
+      logs and traces. Needs CloudWatch Transaction Search turned on (scripts/enable-transaction-search) and
+      an xray VPC endpoint.
+  TraceSamplingRate:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 1
+    Description: Share of requests traced by this stack's X-Ray sampling rule (1 = all, good for a POC; lower it later to cut cost)
+  AdotLambdaLayerArn:
+    Type: String
+    Default: auto
+    Description: >
+      AWS Lambda Layer for OpenTelemetry (Python). "auto" picks the version listed in this template for
+      us-east-1 / ca-central-1; otherwise give the full layer ARN for your Region.
   CreateApiGatewayAccountRole:
     Type: String
     AllowedValues: ["true", "false"]
@@ -89,7 +111,17 @@ Parameters:
     Default: dev
     MinLength: 1
 
+Mappings:
+  # AWS Lambda Layer for OpenTelemetry (ADOT Python), from aws-otel.github.io/docs/getting-started/lambda
+  AdotPythonLayer:
+    us-east-1:
+      Arn: arn:aws:lambda:us-east-1:615299751070:layer:AWSOpenTelemetryDistroPython:33
+    ca-central-1:
+      Arn: arn:aws:lambda:ca-central-1:615299751070:layer:AWSOpenTelemetryDistroPython:30
+
 Conditions:
+  TracingOn: !Equals [!Ref EnableTracing, "true"]
+  DefaultAdotLayer: !Equals [!Ref AdotLambdaLayerArn, "auto"]
   CreateKmsKey: !Equals [!Ref ExistingKmsKeyArn, ""]
   CreateApiGwAccount: !Equals [!Ref CreateApiGatewayAccountRole, "true"]
 
@@ -299,13 +331,12 @@ Resources:
           Value: !Ref Environment
         - Key: Project
           Value: !Ref ProjectName
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-deploy-helper"
+      LogGroupName: !Sub "/${ProjectName}/lambda/deploy-helper"
       RetentionInDays: 14
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   DeployHelperFn:
     Type: AWS::Lambda::Function
-    DependsOn: DeployHelperLogGroup
     Properties:
       Tags:
         - Key: AppCatID
@@ -328,6 +359,9 @@ Resources:
       Timeout: 120
       MemorySize: 256
       Role: !GetAtt DeployHelperRole.Arn
+      LoggingConfig:                      # custom-named log group (/<project>/lambda/...)
+        LogGroup: !Ref DeployHelperLogGroup
+        LogFormat: Text
       KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
       # Deliberately NOT in the VPC (same pattern as the RAG POC's schema-init Lambda).
       # It only runs at deploy time, calls DynamoDB and CloudWatch Logs APIs, and must
@@ -563,6 +597,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !If [TracingOn, !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSXrayWriteOnlyAccess", !Ref AWS::NoValue]
       Policies:
         - PolicyName: customers-table
           PolicyDocument:
@@ -601,13 +636,12 @@ Resources:
           Value: !Ref Environment
         - Key: Project
           Value: !Ref ProjectName
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-api"
+      LogGroupName: !Sub "/${ProjectName}/lambda/customer-api"
       RetentionInDays: 14
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   CustomerApiFn:
     Type: AWS::Lambda::Function
-    DependsOn: CustomerApiFnLogGroup
     Properties:
       Tags:
         - Key: AppCatID
@@ -625,10 +659,19 @@ Resources:
       FunctionName: !Sub "${ProjectName}-customer-api"
       Runtime: python3.12
       Architectures: [arm64]
+      TracingConfig:
+        Mode: !If [TracingOn, Active, PassThrough]
+      Layers: !If
+        - TracingOn
+        - [!If [DefaultAdotLayer, !FindInMap [AdotPythonLayer, !Ref "AWS::Region", Arn], !Ref AdotLambdaLayerArn]]
+        - !Ref AWS::NoValue
       Handler: index.handler
       Timeout: 10
       MemorySize: 256
       Role: !GetAtt CustomerApiFnRole.Arn
+      LoggingConfig:                      # custom-named log group (/<project>/lambda/...)
+        LogGroup: !Ref CustomerApiFnLogGroup
+        LogFormat: Text
       KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
@@ -636,6 +679,10 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref CustomersTable
+          # OpenTelemetry (ADOT layer): traces to X-Ray / Transaction Search, incl. AWS SDK and HTTP calls
+          AWS_LAMBDA_EXEC_WRAPPER: !If [TracingOn, /opt/otel-instrument, !Ref AWS::NoValue]
+          OTEL_SERVICE_NAME: !If [TracingOn, !Sub "${ProjectName}-customer-api", !Ref AWS::NoValue]
+          OTEL_AWS_APPLICATION_SIGNALS_ENABLED: !If [TracingOn, "false", !Ref AWS::NoValue]
       Code:
         ZipFile: |
           import json, os, re, uuid, datetime
@@ -889,7 +936,7 @@ Resources:
           Value: !Ref Environment
         - Key: Project
           Value: !Ref ProjectName
-      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-customer-api/access"
+      LogGroupName: !Sub "/${ProjectName}/apigateway/customer-api/access"
       RetentionInDays: 90
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
@@ -997,6 +1044,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !If [TracingOn, !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSXrayWriteOnlyAccess", !Ref AWS::NoValue]
       Policies:
         - PolicyName: invoke-customer-api
           PolicyDocument:
@@ -1027,13 +1075,12 @@ Resources:
           Value: !Ref Environment
         - Key: Project
           Value: !Ref ProjectName
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-customer-tools"
+      LogGroupName: !Sub "/${ProjectName}/lambda/customer-tools"
       RetentionInDays: 14
       KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
 
   ToolFn:
     Type: AWS::Lambda::Function
-    DependsOn: ToolFnLogGroup
     Properties:
       Tags:
         - Key: AppCatID
@@ -1051,10 +1098,19 @@ Resources:
       FunctionName: !Sub "${ProjectName}-customer-tools"
       Runtime: python3.12
       Architectures: [arm64]
+      TracingConfig:
+        Mode: !If [TracingOn, Active, PassThrough]
+      Layers: !If
+        - TracingOn
+        - [!If [DefaultAdotLayer, !FindInMap [AdotPythonLayer, !Ref "AWS::Region", Arn], !Ref AdotLambdaLayerArn]]
+        - !Ref AWS::NoValue
       Handler: index.handler
       Timeout: 30
       MemorySize: 256
       Role: !GetAtt ToolFnRole.Arn
+      LoggingConfig:                      # custom-named log group (/<project>/lambda/...)
+        LogGroup: !Ref ToolFnLogGroup
+        LogFormat: Text
       KmsKeyArn: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
       VpcConfig:
         SubnetIds: !Ref PrivateSubnetIds
@@ -1066,6 +1122,10 @@ Resources:
           # and has private DNS disabled (the plain {api-id}.execute-api name then returns 403 Forbidden).
           API_BASE_URL: !Sub "https://${CustomerApi}-${ExecuteApiVpceId}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
           LOG_LEVEL: INFO              # DEBUG adds botocore wire-level logs
+          # OpenTelemetry (ADOT layer): traces to X-Ray / Transaction Search, incl. AWS SDK and HTTP calls
+          AWS_LAMBDA_EXEC_WRAPPER: !If [TracingOn, /opt/otel-instrument, !Ref AWS::NoValue]
+          OTEL_SERVICE_NAME: !If [TracingOn, !Sub "${ProjectName}-customer-tools", !Ref AWS::NoValue]
+          OTEL_AWS_APPLICATION_SIGNALS_ENABLED: !If [TracingOn, "false", !Ref AWS::NoValue]
       Code:
         ZipFile: |
           import ipaddress, json, logging, os, socket, threading, time, urllib.request, urllib.error, urllib.parse
@@ -1386,6 +1446,318 @@ Resources:
             Namespaces: ["/summaries/{actorId}/{sessionId}/"]
 
   # =====================================================================
+  # Tracing (GenAI Observability) - only when EnableTracing is "true".
+  #   Agent, tool Lambda and customer API Lambda emit OpenTelemetry spans (ADOT).
+  #   Gateway and Memory deliver their own logs (to KMS-encrypted log groups) and
+  #   traces (to X-Ray) through CloudWatch Logs vended-log deliveries.
+  #   Prerequisite (once per account/Region): CloudWatch Transaction Search -
+  #   scripts/enable-transaction-search.sh / .ps1.
+  # =====================================================================
+  XRayTraceDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "X-Ray destination for Gateway and Memory traces"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-xray"
+      DeliveryDestinationType: XRAY
+
+  GatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: TracingOn
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Gateway application logs"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/${ProjectName}/gateway/${McpGateway.GatewayIdentifier}"
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  GatewayLogsSource:
+    Type: AWS::Logs::DeliverySource
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Gateway log delivery source"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-gateway-logs"
+      LogType: APPLICATION_LOGS
+      ResourceArn: !GetAtt McpGateway.GatewayArn
+
+  GatewayLogsDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Gateway log delivery destination"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-gateway-logs"
+      DestinationResourceArn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${GatewayLogGroup}"
+
+  GatewayLogsDelivery:
+    Type: AWS::Logs::Delivery
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Gateway log delivery"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      DeliverySourceName: !Ref GatewayLogsSource
+      DeliveryDestinationArn: !GetAtt GatewayLogsDestination.Arn
+
+  GatewayTracesSource:
+    Type: AWS::Logs::DeliverySource
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Gateway trace delivery source"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-gateway-traces"
+      LogType: TRACES
+      ResourceArn: !GetAtt McpGateway.GatewayArn
+
+  GatewayTracesDelivery:
+    Type: AWS::Logs::Delivery
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Gateway trace delivery"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      DeliverySourceName: !Ref GatewayTracesSource
+      DeliveryDestinationArn: !GetAtt XRayTraceDestination.Arn
+
+  MemoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: TracingOn
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Memory application logs"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LogGroupName: !Sub "/${ProjectName}/memory/${AgentMemory.MemoryId}"
+      RetentionInDays: 30
+      KmsKeyId: !If [CreateKmsKey, !GetAtt KmsKey.Arn, !Ref ExistingKmsKeyArn]
+
+  MemoryLogsSource:
+    Type: AWS::Logs::DeliverySource
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Memory log delivery source"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-memory-logs"
+      LogType: APPLICATION_LOGS
+      ResourceArn: !GetAtt AgentMemory.MemoryArn
+
+  MemoryLogsDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Memory log delivery destination"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-memory-logs"
+      DestinationResourceArn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MemoryLogGroup}"
+
+  MemoryLogsDelivery:
+    Type: AWS::Logs::Delivery
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Memory log delivery"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      DeliverySourceName: !Ref MemoryLogsSource
+      DeliveryDestinationArn: !GetAtt MemoryLogsDestination.Arn
+
+  MemoryTracesSource:
+    Type: AWS::Logs::DeliverySource
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Memory trace delivery source"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      Name: !Sub "${ProjectName}-memory-traces"
+      LogType: TRACES
+      ResourceArn: !GetAtt AgentMemory.MemoryArn
+
+  MemoryTracesDelivery:
+    Type: AWS::Logs::Delivery
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "AgentCore Memory trace delivery"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      DeliverySourceName: !Ref MemoryTracesSource
+      DeliveryDestinationArn: !GetAtt XRayTraceDestination.Arn
+
+  # Trace every request through this stack's services (API Gateway stage, Lambdas) at
+  # TraceSamplingRate. API Gateway's service name is "<api name>/<stage>", Lambdas use the
+  # function name - all start with ProjectName. The account's default rule (1/s + 5%) still
+  # applies to everything else.
+  TraceSamplingRule:
+    Type: AWS::XRay::SamplingRule
+    Condition: TracingOn
+    Properties:
+      Tags:
+        - Key: AppCatID
+          Value: !Ref AppCatID
+        - Key: Description
+          Value: "X-Ray sampling for the agent stack"
+        - Key: ServiceName
+          Value: !Ref ServiceName
+        - Key: Support-Team
+          Value: !Ref SupportTeam
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      SamplingRule:
+        RuleName: !Sub "${ProjectName}-all"
+        Priority: 100
+        FixedRate: !Ref TraceSamplingRate
+        ReservoirSize: 10
+        ServiceName: !Sub "${ProjectName}-*"
+        ServiceType: "*"
+        Host: "*"
+        HTTPMethod: "*"
+        URLPath: "*"
+        ResourceARN: "*"
+        Version: 1
+
+  # =====================================================================
   # AgentCore Runtime (Strands agent, VPC mode)
   # =====================================================================
   RuntimeRole:
@@ -1462,10 +1834,17 @@ Resources:
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
               - Sid: Observability
                 Effect: Allow
-                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules,
+                         xray:GetSamplingTargets, cloudwatch:PutMetricData]
                 Resource: "*"
                 Condition:
                   StringEqualsIfExists: { cloudwatch:namespace: bedrock-agentcore }
+              # Lets AgentCore allow X-Ray to deliver this agent's spans into its own log group
+              # (/aws/bedrock-agentcore/runtimes/<agent>-<endpoint>, "spans" stream)
+              - Sid: SpansToAgentLogGroup
+                Effect: Allow
+                Action: [logs:PutResourcePolicy, logs:DescribeResourcePolicies]
+                Resource: "*"
 
   AgentRuntime:
     Type: AWS::BedrockAgentCore::Runtime
@@ -1486,7 +1865,8 @@ Resources:
       AgentRuntimeArtifact:
         CodeConfiguration:
           Runtime: PYTHON_3_12
-          EntryPoint: [customer_agent.py]
+          # opentelemetry-instrument = ADOT auto-instrumentation (aws-opentelemetry-distro in requirements.txt)
+          EntryPoint: !If [TracingOn, [opentelemetry-instrument, customer_agent.py], [customer_agent.py]]
           Code:
             S3:
               Bucket: !Ref ArtifactBucket

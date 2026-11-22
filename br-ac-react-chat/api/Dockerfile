@@ -4,9 +4,13 @@
 ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
 FROM ${BASE_IMAGE}
 
+# The first PYTHONPATH entry holds OpenTelemetry's sitecustomize.py, which Python runs at start-up:
+# it does what "opentelemetry-instrument" does (that console script can't be used - pip --target
+# console scripts point at the notebook's Python). It loads the ADOT distro, instruments FastAPI
+# and boto3, and exports spans as the stack's OTEL_* settings say. OTEL_SDK_DISABLED=true turns it off.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/packages \
+    PYTHONPATH=/app/packages/opentelemetry/instrumentation/auto_instrumentation:/app/packages \
     HOME=/app/run \
     TMPDIR=/app/run
 

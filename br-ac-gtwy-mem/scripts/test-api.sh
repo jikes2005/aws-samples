@@ -6,7 +6,7 @@
 # Those credentials need execute-api:Invoke on the API (the tool Lambda's role has it).
 # Needs curl 7.75+ (for --aws-sigv4) and AWS CLI v2.
 set -euo pipefail
-PROJECT="${PROJECT:-agentcore-poc}"
+PROJECT="${PROJECT:-br-ac-gtwy-mem}"
 REGION="${AWS_REGION:-ca-central-1}"
 
 BASE=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$PROJECT" \

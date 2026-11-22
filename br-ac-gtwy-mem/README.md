@@ -42,6 +42,7 @@ Everything is in **one CloudFormation template** (`cfn/agentcore-poc.yaml`) and 
 | `scripts/deploy.sh` | Packages the agent for linux/arm64, uploads it to S3, deploys the stack, redeploys the API stage |
 | `scripts/invoke.py` | Calls the runtime with a prompt from your laptop (`ACTOR_ID` / `SESSION_ID` for memory) |
 | `scripts/test-api.sh` | Curls the API with SigV4-signed requests (run from inside the VPC) |
+| `scripts/enable-transaction-search.sh` / `.ps1` | One-time, account-wide switch that sends X-Ray spans to CloudWatch (needed for GenAI Observability) |
 
 ## Prerequisites — what must already exist
 
@@ -57,6 +58,7 @@ Don't allow 443 from the stack's workload security group instead. That rule woul
 | `com.amazonaws.<region>.bedrock-agentcore.gateway` | Agent → MCP gateway |
 | `com.amazonaws.<region>.bedrock-agentcore` | Agent → AgentCore Memory (data plane: events and memory records) |
 | `com.amazonaws.<region>.logs` | Agent runtime logging |
+| `com.amazonaws.<region>.xray` | Tracing (`EnableTracing=true`): the Lambdas and the agent send spans to X-Ray. `deploy.sh` warns if it's missing |
 
 Also needed:
 - AWS CLI v2, Python 3.12 + pip, `zip`
@@ -81,10 +83,13 @@ export ARTIFACT_BUCKET=my-artifacts-bucket
 # export ENVIRONMENT=dev
 # export KMS_KEY_ARN=arn:aws:kms:...:key/...   # use an existing CMK (blank = stack creates one)
 # export CREATE_APIGW_ACCOUNT_ROLE=true        # only if the account has no API Gateway CloudWatch role
+# export ENABLE_TRACING=false                  # default true (ADOT traces to GenAI Observability)
+# export TRACE_SAMPLING_RATE=0.1               # default 1 = every request
+./scripts/enable-transaction-search.sh         # once per account/Region, only needed for tracing
 ./scripts/deploy.sh
 ```
 
-The stack name is `agentcore-poc` (override with `PROJECT`). Re-running uploads a new agent zip under a new key, which updates the runtime, and redeploys the API stage.
+The stack name is `br-ac-gtwy-mem` (override with `PROJECT`; it's also the `ProjectName` parameter and the log-group prefix). Re-running uploads a new agent zip under a new key, which updates the runtime, and redeploys the API stage.
 
 You can also deploy the template from the console or a pipeline. Upload the agent zip first and pass its key as `AgentCodeKey`.
 
@@ -133,7 +138,7 @@ python scripts/invoke.py "Show me my customers"     # recalls Ontario + table fo
 ACTOR_ID=someone-else python scripts/invoke.py "Show me my customers"   # no memories for this actor
 
 # See what was extracted
-MEM=$(aws cloudformation describe-stacks --stack-name agentcore-poc \
+MEM=$(aws cloudformation describe-stacks --stack-name br-ac-gtwy-mem \
   --query "Stacks[0].Outputs[?OutputKey=='MemoryId'].OutputValue" --output text)
 aws bedrock-agentcore list-memory-records --memory-id $MEM --namespace /preferences/demo-user/
 aws bedrock-agentcore list-memory-records --memory-id $MEM --namespace /facts/demo-user/
@@ -143,7 +148,7 @@ aws bedrock-agentcore list-memory-records --memory-id $MEM --namespace /facts/de
 
 ```bash
 CTX=$(printf '{"custom":{"bedrockAgentCoreToolName":"customer-tools___get_customer"}}' | base64 -w0)
-aws lambda invoke --function-name agentcore-poc-customer-tools \
+aws lambda invoke --function-name br-ac-gtwy-mem-customer-tools \
   --client-context "$CTX" --cli-binary-format raw-in-base64-out \
   --payload file://events/tool-get-customer.json out.json && cat out.json
 ```
@@ -283,6 +288,52 @@ DynamoDB's own backups don't need AWS Backup or a vault.
 - **On demand:** to take another native on-demand backup, bump `BackupVersion` on the `OnDemandBackup` resource and redeploy, or run `aws dynamodb create-backup` at any time.
 - **Retention:** the stack's on-demand backup is deleted with the stack. When you bump `BackupVersion`, the previous one is deleted. Backups you take by hand are yours to delete.
 
+## Tracing (GenAI Observability)
+
+With `EnableTracing=true` (the default) every hop sends OpenTelemetry spans to AWS X-Ray, and they show up in **CloudWatch → GenAI Observability → Bedrock AgentCore** and in **Application Signals → Transaction Search**.
+
+| Hop | How it's traced |
+|---|---|
+| Agent (AgentCore Runtime) | The zip includes `aws-opentelemetry-distro` (ADOT) and the runtime starts the agent with `opentelemetry-instrument`. Strands emits spans for the agent loop, each model call and each tool call, tagged with `session.id` and `user.id` |
+| AgentCore Gateway | Vended trace delivery to X-Ray, plus application logs to `/<ProjectName>/gateway/<gateway-id>` |
+| AgentCore Memory | Vended trace delivery to X-Ray, plus application logs to `/<ProjectName>/memory/<memory-id>` |
+| Tool Lambda, API Lambda | Lambda active tracing plus the ADOT Python layer (`AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument`). boto3 and HTTP calls, including DynamoDB, become child spans |
+| Private REST API | Context is passed through in the `X-Amzn-Trace-Id` header from the tool Lambda to the API Lambda |
+
+A caller that starts its own trace (like the chat app's API) can pass `traceParent` / `baggage` to `InvokeAgentRuntime`, and the agent's spans join that trace.
+
+**Parameters:** `EnableTracing` (`true`/`false`), `TraceSamplingRate` (0–1, an X-Ray sampling rule for services named `<ProjectName>-*`), `AdotLambdaLayerArn` (`auto` picks the published ADOT Python layer for us-east-1 and ca-central-1; give an ARN for any other Region).
+
+**Prerequisites**
+- **Transaction Search** turned on once per account and Region: `./scripts/enable-transaction-search.sh` (or `.ps1`). It's account-wide and changes where *all* X-Ray traces in the Region go, so check with your platform team first. Indexing defaults to 100% here; lower it after the POC (`./scripts/enable-transaction-search.sh 1`).
+- The `xray` VPC endpoint (see Prerequisites).
+- It takes a few minutes after the first invocation before traces appear.
+
+**Known gaps**
+- The Gateway doesn't always pass the agent's trace context to the tool Lambda. When it doesn't, the Lambda's spans form a separate trace; find it in Transaction Search by time or by the `session.id` attribute rather than in the agent's trace tree.
+- Spans and agent logs can include prompts, model responses and tool results — here, customer names and details. Treat the `aws/spans` log group like the data itself (it's encrypted with the CloudWatch Logs default key unless you set one on the account).
+- To turn tracing off, redeploy with `ENABLE_TRACING=false`. Transaction Search stays on until you change it with `aws xray update-trace-segment-destination --destination XRay`.
+
+## Log groups
+
+The stack names its log groups `/<ProjectName>/<component>/...` (`ProjectName` parameter, default `br-ac-gtwy-mem`). All of them use the CMK, keep 30 days, carry the required tags and are deleted with the stack.
+
+| Log group | What writes to it |
+|---|---|
+| `/<ProjectName>/lambda/customer-tools` | Tool Lambda (`LoggingConfig` points the function at this group) |
+| `/<ProjectName>/lambda/customer-api` | API Lambda |
+| `/<ProjectName>/lambda/deploy-helper` | Deploy helper (custom resources) |
+| `/<ProjectName>/apigateway/customer-api/access` | API Gateway access log |
+| `/<ProjectName>/gateway/<gateway-id>` | AgentCore Gateway application logs (vended log delivery, `EnableTracing=true`) |
+| `/<ProjectName>/memory/<memory-id>` | AgentCore Memory application logs (vended log delivery, `EnableTracing=true`) |
+
+AWS fixes three names, so they don't follow the pattern:
+- `API-Gateway-Execution-Logs_<api-id>/<stage>` (API Gateway execution logs);
+- `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT` (the agent's stdout, written by AgentCore Runtime);
+- `aws/spans` (Transaction Search).
+
+The Gateway and Memory deliveries add their log groups to a CloudWatch Logs resource policy so the delivery service can write to them. The policy size limit (5,120 characters) only matters with many such groups. The deploying identity needs `logs:PutResourcePolicy` and `logs:DescribeResourcePolicies`.
+
 ## Agent logging and troubleshooting
 
 The agent logs to stdout. AgentCore ships those logs to `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT`, which the stack deletes on stack delete. A healthy start and invocation look like this:
@@ -325,11 +376,11 @@ If it still times out, look at the first lines of the runtime log:
 
 ## Troubleshooting the customer API (403 / 5xx)
 
-The tool Lambda's log (`/aws/lambda/<project>-customer-tools`) shows each call's status and API Gateway request ID. To find out **why** API Gateway rejected a request, use two log groups the stack creates:
+The tool Lambda's log (`/<ProjectName>/lambda/customer-tools`) shows each call's status and API Gateway request ID. To find out **why** API Gateway rejected a request, use two log groups the stack creates:
 
 | Log group | What it shows |
 |---|---|
-| `/aws/apigateway/<project>-customer-api/access` | One line per request: `status`, `caller`, `vpceId`, `errorMessage`, `authError`, `wafResponseCode`, `webAclArn` |
+| `/<ProjectName>/apigateway/customer-api/access` | One line per request: `status`, `caller`, `vpceId`, `errorMessage`, `authError`, `wafResponseCode`, `webAclArn` |
 | `API-Gateway-Execution-Logs_<api-id>/<stage>` | API Gateway's decision trail: IAM/resource-policy evaluation, authorizer, integration. Search it for the request ID |
 
 Common causes of `403 {"message":"Forbidden"}` on this private API:
@@ -361,8 +412,8 @@ Common causes of `403 {"message":"Forbidden"}` on this private API:
 ## Cleanup
 
 ```bash
-aws cloudformation delete-stack --stack-name agentcore-poc
-aws cloudformation wait stack-delete-complete --stack-name agentcore-poc
+aws cloudformation delete-stack --stack-name br-ac-gtwy-mem
+aws cloudformation wait stack-delete-complete --stack-name br-ac-gtwy-mem
 ```
 
 Deleting the stack removes everything it created. No resources have `DeletionPolicy: Retain`. A few things CloudFormation can't remove by itself are handled by the deploy helper during the delete:
@@ -380,6 +431,6 @@ Deletion takes a few minutes, mostly waiting for Lambda VPC network interfaces t
 
 **Not removed**, because the stack doesn't own them:
 
-- **Your VPC, subnets, VPC endpoints and the artifact S3 bucket.** The agent zips that `deploy.sh` uploaded under `agentcore-poc/` stay in the bucket. Delete them with `aws s3 rm s3://<bucket>/agentcore-poc/ --recursive`.
+- **Your VPC, subnets, VPC endpoints and the artifact S3 bucket.** The agent zips that `deploy.sh` uploaded under `br-ac-gtwy-mem/` stay in the bucket. Delete them with `aws s3 rm s3://<bucket>/agentcore-poc/ --recursive`.
 - **Recovery points made by your organisation's backup policy** (from the `dynamodbbackup` tag). Those live in the org's vault under its retention rules.
 - **The account-level API Gateway CloudWatch setting:** if you deployed with `CREATE_APIGW_ACCOUNT_ROLE=true`, deleting the stack deletes that role. The account setting keeps pointing at it, so other APIs' logging in that account and region stops until it's set again.

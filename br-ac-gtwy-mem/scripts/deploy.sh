@@ -6,7 +6,7 @@
 # Usage: export the variables below, then ./scripts/deploy.sh
 set -euo pipefail
 
-PROJECT="${PROJECT:-agentcore-poc}"
+PROJECT="${PROJECT:-br-ac-gtwy-mem}"
 REGION="${AWS_REGION:-ca-central-1}"
 VPC_ID="${VPC_ID:?set VPC_ID}"
 SUBNET_IDS="${SUBNET_IDS:?set SUBNET_IDS, comma-separated private subnets}"
@@ -21,6 +21,8 @@ SERVICE_NAME="${SERVICE_NAME:-AgentCore POC}"
 ENVIRONMENT="${ENVIRONMENT:-dev}"
 KMS_KEY_ARN="${KMS_KEY_ARN:-}"           # blank = stack creates its own CMK
 CREATE_APIGW_ACCOUNT_ROLE="${CREATE_APIGW_ACCOUNT_ROLE:-false}"  # true only if the account has no API GW CloudWatch role
+ENABLE_TRACING="${ENABLE_TRACING:-true}"          # ADOT/X-Ray traces -> GenAI Observability
+TRACE_SAMPLING_RATE="${TRACE_SAMPLING_RATE:-1}"   # 0-1; 1 = trace every request (POC)
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$ROOT/build"
@@ -33,6 +35,22 @@ if [[ "$CREATE_APIGW_ACCOUNT_ROLE" != "true" ]]; then
     echo "ERROR: API Gateway has no CloudWatch Logs role in $REGION, so stage access logging will fail."
     echo "       Re-run with CREATE_APIGW_ACCOUNT_ROLE=true (sets the account-level role) or ask your platform team."
     exit 1
+  fi
+fi
+
+if [[ "$ENABLE_TRACING" == "true" ]]; then
+  # Warnings only - the stack deploys either way, but no spans show up until these are in place.
+  DEST=$(aws xray get-trace-segment-destination --region "$REGION" --query Destination --output text 2>/dev/null || echo unknown)
+  if [[ "$DEST" != "CloudWatchLogs" ]]; then
+    echo "WARNING: CloudWatch Transaction Search is off in $REGION (destination: $DEST) - traces won't appear"
+    echo "         in GenAI Observability. Run once per account/Region: ./scripts/enable-transaction-search.sh"
+  fi
+  XRAY_VPCE=$(aws ec2 describe-vpc-endpoints --region "$REGION" \
+    --filters Name=vpc-id,Values="$VPC_ID" Name=service-name,Values="com.amazonaws.$REGION.xray" \
+    --query "VpcEndpoints[?State=='available'] | length(@)" --output text 2>/dev/null || echo "?")
+  if [[ "$XRAY_VPCE" == "0" ]]; then
+    echo "WARNING: no com.amazonaws.$REGION.xray interface endpoint in $VPC_ID - the Lambdas can't send"
+    echo "         spans without internet egress. Add one (private DNS on) or set ENABLE_TRACING=false."
   fi
 fi
 
@@ -58,6 +76,7 @@ aws cloudformation deploy --region "$REGION" \
     ExistingKmsKeyArn="$KMS_KEY_ARN" \
     CreateApiGatewayAccountRole="$CREATE_APIGW_ACCOUNT_ROLE" \
     ArtifactBucket="$ARTIFACT_BUCKET" AgentCodeKey="$CODE_KEY" ModelId="$MODEL_ID" \
+    EnableTracing="$ENABLE_TRACING" TraceSamplingRate="$TRACE_SAMPLING_RATE" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
 
 echo "==> 3/3 redeploy API stage (CloudFormation doesn't redeploy a stage when methods change)"

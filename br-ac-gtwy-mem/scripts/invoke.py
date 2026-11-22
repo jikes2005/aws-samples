@@ -17,7 +17,7 @@ import uuid
 
 import boto3
 
-STACK = os.environ.get("PROJECT", "agentcore-poc")
+STACK = os.environ.get("PROJECT", "br-ac-gtwy-mem")
 REGION = boto3.Session().region_name or "ca-central-1"
 ACTOR_ID = os.environ.get("ACTOR_ID", "demo-user")
 SESSION_ID = os.environ.get("SESSION_ID") or f"{uuid.uuid4()}-poc"   # must be >= 33 chars
