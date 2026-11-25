@@ -1,0 +1,490 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Services stack for PoC
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: av-ecs-poc
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"
+  BaseStackName:
+    Type: String
+    Default: av-ecs-poc-base
+  ImageTag:
+    Type: String
+    Default: v1
+  DirectorCount:
+    Type: Number
+    Default: 2
+  ServerCount:
+    Type: Number
+    Default: 3
+  GuardCount:
+    Type: Number
+    Default: 2
+  AgentDevices:
+    Type: Number
+    Default: 10
+    Description: Simulated devices (one long-lived tunnel each) run by the agent task.
+  AgentCount:
+    Type: Number
+    Default: 1
+    Description: Set to 0 to stop the simulated agents.
+  NlbIdleTimeoutSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 60
+    MaxValue: 6000
+    Description: TCP idle timeout on both NLB listeners (long-lived WebSocket and gRPC tunnels).
+  DeclareDevicePortRange:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Declare 10000-10099 as a containerPortRange on the Guard task (set false to test without it).
+  AppCatID:
+    Type: String
+    Default: "000000"
+  ServiceNameTag:
+    Type: String
+    Default: av-ecs-poc
+  SupportTeam:
+    Type: String
+    Default: cloud-architecture
+  Environment:
+    Type: String
+    Default: lab
+
+Conditions:
+  DeclareRange: !Equals [!Ref DeclareDevicePortRange, "true"]
+
+Resources:
+  # ------------------------------------------------------------------ Task definitions
+  TaskDefDirector:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-director
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
+      TaskRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-RegistryTaskRoleArn" }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${BaseStackName}-RepositoryUri" }
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - { Name: director-http, ContainerPort: 11000, Protocol: tcp }
+          Environment:
+            - { Name: ROLE, Value: director }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: DIRECTOR_PORT, Value: "11000" }
+            - { Name: CMD_TIMEOUT_SECONDS, Value: "330" }
+            - { Name: TABLE_SERVERS, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-TableServers" } }
+            - { Name: TABLE_DEVICES, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-TableDevices" } }
+          HealthCheck:
+            Command: ["CMD", "python", "/app/healthcheck.py"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: { "Fn::ImportValue": !Sub "${BaseStackName}-LogGroupDirector" }
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: director
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director task definition }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+
+  TaskDefServer:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-server
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
+      TaskRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-RegistryTaskRoleArn" }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${BaseStackName}-RepositoryUri" }
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - { Name: server-http, ContainerPort: 8261, Protocol: tcp, AppProtocol: http }
+          Environment:
+            - { Name: ROLE, Value: server }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: SERVER_PORT, Value: "8261" }
+            - { Name: CMD_TIMEOUT_SECONDS, Value: "330" }
+            - { Name: HEARTBEAT_SECONDS, Value: "10" }
+            - { Name: SERVER_STALE_SECONDS, Value: "30" }
+            - { Name: REHOME_SECONDS, Value: "15" }
+            - { Name: TABLE_SERVERS, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-TableServers" } }
+            - { Name: TABLE_DEVICES, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-TableDevices" } }
+          HealthCheck:
+            Command: ["CMD", "python", "/app/healthcheck.py"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: { "Fn::ImportValue": !Sub "${BaseStackName}-LogGroupServer" }
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: server
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: NG server task definition }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+
+  TaskDefGuard:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-guard
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${BaseStackName}-RepositoryUri" }
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings: !If
+            - DeclareRange
+            - - { Name: guard-tunnel, ContainerPort: 9000, Protocol: tcp }
+              - { ContainerPortRange: "10000-10099", Protocol: tcp }
+            - - { Name: guard-tunnel, ContainerPort: 9000, Protocol: tcp }
+          Environment:
+            - { Name: ROLE, Value: guard }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: TUNNEL_PORT, Value: "9000" }
+            - { Name: DEVICE_PORT_MIN, Value: "10000" }
+            - { Name: DEVICE_PORT_MAX, Value: "10099" }
+            - { Name: GUARD_API_ROOT, Value: "http://ng-server:8261" }
+            - { Name: CMD_TIMEOUT_SECONDS, Value: "330" }
+          HealthCheck:
+            Command: ["CMD", "python", "/app/healthcheck.py"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: { "Fn::ImportValue": !Sub "${BaseStackName}-LogGroupGuard" }
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: guard
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Guard task definition }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+
+  TaskDefAgent:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-agent
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${BaseStackName}-RepositoryUri" }
+          Essential: true
+          ReadonlyRootFilesystem: true
+          Environment:
+            - { Name: ROLE, Value: agent }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: AGENT_TARGETS, Value: !Sub "${GuardNlb.DNSName}:9000" }
+            - { Name: AGENT_DEVICES, Value: !Ref AgentDevices }
+            - { Name: AGENT_PREFIX, Value: dev- }
+            - { Name: AGENT_PING_SECONDS, Value: "30" }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: { "Fn::ImportValue": !Sub "${BaseStackName}-LogGroupAgent" }
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: agent
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Simulated agent task definition }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+
+  # ------------------------------------------------------------------ Director NLB (workstations, any instance)
+  DirectorNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-dir
+      Type: network
+      Scheme: internal
+      Subnets: !Split [",", { "Fn::ImportValue": !Sub "${BaseStackName}-SubnetIds" }]
+      SecurityGroups: [{ "Fn::ImportValue": !Sub "${BaseStackName}-SgDirectorNlb" }]
+      LoadBalancerAttributes:
+        - { Key: load_balancing.cross_zone.enabled, Value: "true" }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director NLB }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+
+  DirectorTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-dir
+      Port: 11000
+      Protocol: TCP
+      TargetType: ip
+      VpcId: { "Fn::ImportValue": !Sub "${BaseStackName}-VpcId" }
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director target group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DirectorListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DirectorNlb
+      Port: 11000
+      Protocol: TCP
+      ListenerAttributes:
+        - { Key: tcp.idle_timeout.seconds, Value: !Ref NlbIdleTimeoutSeconds }
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref DirectorTargetGroup }
+
+  # ------------------------------------------------------------------ Guard NLB (branch agents, long-lived tunnels)
+  GuardNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-grd
+      Type: network
+      Scheme: internal
+      Subnets: !Split [",", { "Fn::ImportValue": !Sub "${BaseStackName}-SubnetIds" }]
+      SecurityGroups: [{ "Fn::ImportValue": !Sub "${BaseStackName}-SgGuardNlb" }]
+      LoadBalancerAttributes:
+        - { Key: load_balancing.cross_zone.enabled, Value: "true" }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Guard NLB }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+
+  GuardTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-grd
+      Port: 9000
+      Protocol: TCP
+      TargetType: ip
+      VpcId: { "Fn::ImportValue": !Sub "${BaseStackName}-VpcId" }
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Guard target group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  GuardListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GuardNlb
+      Port: 9000
+      Protocol: TCP
+      ListenerAttributes:
+        - { Key: tcp.idle_timeout.seconds, Value: !Ref NlbIdleTimeoutSeconds }
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref GuardTargetGroup }
+
+  # ------------------------------------------------------------------ ECS services
+  # NG Server: Service Connect endpoint "ng-server:8261" for the any-instance path
+  # (Guard -> server). The proxy listens on 18261 (ingressPortOverride), so the
+  # Director's direct calls to <task-ip>:8261 reach the app without the proxy.
+  ServerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-server
+      Cluster: { "Fn::ImportValue": !Sub "${BaseStackName}-ClusterName" }
+      TaskDefinition: !Ref TaskDefServer
+      LaunchType: FARGATE
+      DesiredCount: !Ref ServerCount
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${BaseStackName}-SubnetIds" }]
+          SecurityGroups: [{ "Fn::ImportValue": !Sub "${BaseStackName}-SgServer" }]
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: { "Fn::ImportValue": !Sub "${BaseStackName}-NamespaceArn" }
+        Services:
+          - PortName: server-http
+            DiscoveryName: ng-server
+            ClientAliases:
+              - { DnsName: ng-server, Port: 8261 }
+            IngressPortOverride: 18261
+            Timeout:
+              IdleTimeoutSeconds: 3600
+              PerRequestTimeoutSeconds: 0
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: { "Fn::ImportValue": !Sub "${BaseStackName}-LogGroupServer" }
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: sc-proxy
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: NG server service }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DirectorService:
+    Type: AWS::ECS::Service
+    DependsOn: [DirectorListener, ServerService]
+    Properties:
+      ServiceName: !Sub ${ProjectName}-director
+      Cluster: { "Fn::ImportValue": !Sub "${BaseStackName}-ClusterName" }
+      TaskDefinition: !Ref TaskDefDirector
+      LaunchType: FARGATE
+      DesiredCount: !Ref DirectorCount
+      HealthCheckGracePeriodSeconds: 60
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${BaseStackName}-SubnetIds" }]
+          SecurityGroups: [{ "Fn::ImportValue": !Sub "${BaseStackName}-SgDirector" }]
+      LoadBalancers:
+        - { ContainerName: app, ContainerPort: 11000, TargetGroupArn: !Ref DirectorTargetGroup }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director service }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # Guard: Service Connect client only (resolves ng-server:8261); tunnels via the NLB
+  GuardService:
+    Type: AWS::ECS::Service
+    DependsOn: [GuardListener, ServerService]
+    Properties:
+      ServiceName: !Sub ${ProjectName}-guard
+      Cluster: { "Fn::ImportValue": !Sub "${BaseStackName}-ClusterName" }
+      TaskDefinition: !Ref TaskDefGuard
+      LaunchType: FARGATE
+      DesiredCount: !Ref GuardCount
+      HealthCheckGracePeriodSeconds: 60
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${BaseStackName}-SubnetIds" }]
+          SecurityGroups: [{ "Fn::ImportValue": !Sub "${BaseStackName}-SgGuard" }]
+      LoadBalancers:
+        - { ContainerName: app, ContainerPort: 9000, TargetGroupArn: !Ref GuardTargetGroup }
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: { "Fn::ImportValue": !Sub "${BaseStackName}-NamespaceArn" }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Guard service }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  AgentService:
+    Type: AWS::ECS::Service
+    DependsOn: [GuardService, DirectorService]
+    Properties:
+      ServiceName: !Sub ${ProjectName}-agent
+      Cluster: { "Fn::ImportValue": !Sub "${BaseStackName}-ClusterName" }
+      TaskDefinition: !Ref TaskDefAgent
+      LaunchType: FARGATE
+      DesiredCount: !Ref AgentCount
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split [",", { "Fn::ImportValue": !Sub "${BaseStackName}-SubnetIds" }]
+          SecurityGroups: [{ "Fn::ImportValue": !Sub "${BaseStackName}-SgAgent" }]
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Simulated branch agents }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+Outputs:
+  DirectorUrl:
+    Description: Workstation entry point (internal NLB, any Director instance)
+    Value: !Sub "http://${DirectorNlb.DNSName}:11000"
+  GuardEndpoint:
+    Description: Branch agent tunnel endpoint (internal NLB, any Guard instance)
+    Value: !Sub "${GuardNlb.DNSName}:9000"

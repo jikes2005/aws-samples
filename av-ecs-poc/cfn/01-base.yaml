@@ -1,0 +1,524 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Base Cloud Formation Template.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: av-ecs-poc
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets (2 or more AZs) for tasks and NLBs.
+  ClientCidr:
+    Type: String
+    Description: CIDR allowed to reach the Director NLB (11000) and Guard NLB (9000) - workstations, notebook, simulated agents.
+  NamespaceName:
+    Type: String
+    Default: ngpoc.internal
+    Description: Cloud Map HTTP namespace used by Service Connect (no Route 53 hosted zone).
+  TableDeletionProtection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false (stack update) before deleting the stack.
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+  AppCatID:
+    Type: String
+    Default: "000000"
+  ServiceNameTag:
+    Type: String
+    Default: av-ecs-poc
+  SupportTeam:
+    Type: String
+    Default: cloud-architecture
+  Environment:
+    Type: String
+    Default: lab
+
+Resources:
+  # ------------------------------------------------------------------ KMS
+  KmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub ${ProjectName} key for DynamoDB ECR and CloudWatch Logs
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${ProjectName}/*"
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: POC customer managed key }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  KmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${ProjectName}
+      TargetKeyId: !Ref KmsKey
+
+  # ------------------------------------------------------------------ ECR
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}/app
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: POC image for director server guard and agent }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ Service Connect namespace and cluster
+  Namespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Properties:
+      Name: !Ref NamespaceName
+      Description: !Sub ${ProjectName} Service Connect namespace
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service Connect namespace }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: POC Fargate cluster }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  LogGroupDirector:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/director
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director logs }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  LogGroupServer:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/server
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: NG server logs }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  LogGroupGuard:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/guard
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Guard logs }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  LogGroupAgent:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/agent
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Simulated agent logs }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ Security groups (one per box in the design)
+  SgDirectorNlb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Director NLB
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-director-nlb" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director NLB security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SgGuardNlb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Guard NLB
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-guard-nlb" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Guard NLB security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SgDirector:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Director tasks
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-director" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director tasks security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SgServer:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NG server tasks
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-server" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: NG server tasks security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SgGuard:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Guard tasks
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-guard" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Guard tasks security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SgAgent:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Simulated agent tasks
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-agent" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Simulated agent tasks security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # Workstation -> NLB -> Director 11000 (any instance)
+  DirectorNlbFromClients:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgDirectorNlb
+      IpProtocol: tcp
+      FromPort: 11000
+      ToPort: 11000
+      CidrIp: !Ref ClientCidr
+      Description: Workstations to director NLB
+
+  DirectorFromNlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgDirector
+      IpProtocol: tcp
+      FromPort: 11000
+      ToPort: 11000
+      SourceSecurityGroupId: !Ref SgDirectorNlb
+      Description: Director NLB to director tasks
+
+  # Director -> one specific server 8261 (task IP, sticky)
+  ServerFromDirector:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgServer
+      IpProtocol: tcp
+      FromPort: 8261
+      ToPort: 8261
+      SourceSecurityGroupId: !Ref SgDirector
+      Description: Director to a specific server by task IP
+
+  # Server -> server 8261 (task IP)
+  ServerFromServer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgServer
+      IpProtocol: tcp
+      FromPort: 8261
+      ToPort: 8261
+      SourceSecurityGroupId: !Ref SgServer
+      Description: Server to server by task IP
+
+  # Guard -> any server via Service Connect (proxy listens on 18261, ingressPortOverride)
+  ServerFromGuardSc:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgServer
+      IpProtocol: tcp
+      FromPort: 18261
+      ToPort: 18261
+      SourceSecurityGroupId: !Ref SgGuard
+      Description: Guard to any server via Service Connect proxy
+
+  # Agent (branch) -> NLB -> Guard 9000 (long-lived tunnel)
+  GuardNlbFromClients:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgGuardNlb
+      IpProtocol: tcp
+      FromPort: 9000
+      ToPort: 9000
+      CidrIp: !Ref ClientCidr
+      Description: Agents to guard NLB
+
+  GuardNlbFromAgents:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgGuardNlb
+      IpProtocol: tcp
+      FromPort: 9000
+      ToPort: 9000
+      SourceSecurityGroupId: !Ref SgAgent
+      Description: Simulated agent tasks to guard NLB
+
+  GuardFromNlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgGuard
+      IpProtocol: tcp
+      FromPort: 9000
+      ToPort: 9000
+      SourceSecurityGroupId: !Ref SgGuardNlb
+      Description: Guard NLB to guard tasks
+
+  # Server -> one specific Guard on its device port (GUARD_EXTERNAL_IP:port)
+  GuardFromServerDevicePorts:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgGuard
+      IpProtocol: tcp
+      FromPort: 10000
+      ToPort: 10099
+      SourceSecurityGroupId: !Ref SgServer
+      Description: Server to a specific guard device port
+
+  # ------------------------------------------------------------------ Registry (stands in for the vendor PostgreSQL)
+  # servers: server_id -> NG_SERVER_NAME (task IP), port, last_heartbeat
+  ServersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub ${ProjectName}-servers
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !Ref TableDeletionProtection
+      AttributeDefinitions:
+        - { AttributeName: server_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: server_id, KeyType: HASH }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !GetAtt KmsKey.Arn }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: NG server registry }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: dynamodbbackup, Value: "True" }
+
+  # devices: device_id -> owner server, GUARD_EXTERNAL_IP:device port
+  DevicesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub ${ProjectName}-devices
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !Ref TableDeletionProtection
+      AttributeDefinitions:
+        - { AttributeName: device_id, AttributeType: S }
+        - { AttributeName: owner_server_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: device_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by-owner
+          KeySchema:
+            - { AttributeName: owner_server_id, KeyType: HASH }
+          Projection: { ProjectionType: KEYS_ONLY }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true, SSEType: KMS, KMSMasterKeyId: !GetAtt KmsKey.Arn }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Device to server and guard mapping }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: dynamodbbackup, Value: "True" }
+
+  # ------------------------------------------------------------------ IAM
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: ECS task execution role }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # Director and server: read/write the registry tables (Guard and agent need no AWS access)
+  RegistryTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: registry
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt ServersTable.Arn
+                  - !GetAtt DevicesTable.Arn
+                  - !Sub "${DevicesTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey*, kms:DescribeKey, kms:CreateGrant]
+                Resource: !GetAtt KmsKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub dynamodb.${AWS::Region}.amazonaws.com
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director and server task role }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+Outputs:
+  # Consumed by 02-services.yaml via Fn::ImportValue (RepositoryUri also used by the build scripts)
+  VpcId:
+    Value: !Ref VpcId
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  SubnetIds:
+    Value: !Join [",", !Ref SubnetIds]
+    Export: { Name: !Sub "${AWS::StackName}-SubnetIds" }
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+    Export: { Name: !Sub "${AWS::StackName}-RepositoryUri" }
+  NamespaceArn:
+    Value: !GetAtt Namespace.Arn
+    Export: { Name: !Sub "${AWS::StackName}-NamespaceArn" }
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${AWS::StackName}-ClusterName" }
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-TaskExecutionRoleArn" }
+  TableServers:
+    Value: !Ref ServersTable
+    Export: { Name: !Sub "${AWS::StackName}-TableServers" }
+  TableDevices:
+    Value: !Ref DevicesTable
+    Export: { Name: !Sub "${AWS::StackName}-TableDevices" }
+  RegistryTaskRoleArn:
+    Value: !GetAtt RegistryTaskRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-RegistryTaskRoleArn" }
+  SgDirectorNlbId:
+    Value: !Ref SgDirectorNlb
+    Export: { Name: !Sub "${AWS::StackName}-SgDirectorNlb" }
+  SgGuardNlbId:
+    Value: !Ref SgGuardNlb
+    Export: { Name: !Sub "${AWS::StackName}-SgGuardNlb" }
+  SgDirectorId:
+    Value: !Ref SgDirector
+    Export: { Name: !Sub "${AWS::StackName}-SgDirector" }
+  SgServerId:
+    Value: !Ref SgServer
+    Export: { Name: !Sub "${AWS::StackName}-SgServer" }
+  SgGuardId:
+    Value: !Ref SgGuard
+    Export: { Name: !Sub "${AWS::StackName}-SgGuard" }
+  SgAgentId:
+    Value: !Ref SgAgent
+    Export: { Name: !Sub "${AWS::StackName}-SgAgent" }
+  LogGroupDirector:
+    Value: !Ref LogGroupDirector
+    Export: { Name: !Sub "${AWS::StackName}-LogGroupDirector" }
+  LogGroupServer:
+    Value: !Ref LogGroupServer
+    Export: { Name: !Sub "${AWS::StackName}-LogGroupServer" }
+  LogGroupGuard:
+    Value: !Ref LogGroupGuard
+    Export: { Name: !Sub "${AWS::StackName}-LogGroupGuard" }
+  LogGroupAgent:
+    Value: !Ref LogGroupAgent
+    Export: { Name: !Sub "${AWS::StackName}-LogGroupAgent" }
