@@ -168,6 +168,7 @@ Resources:
             - { Name: NAMESPACE_NAME, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-NamespaceName" } }
             - { Name: NAMESPACE_MODE, Value: !Ref NamespaceMode }
             - { Name: TARGET_SERVICE, Value: b }
+            - { Name: SERVICE_PORTS, Value: !Sub "a=${PortA},b=${PortB},c=${PortC}" }
             - { Name: DIRECTOR_SERVICE, Value: c }
             - { Name: CLIENT_COUNT, Value: !Ref ClientCount }
             - { Name: CLIENT_PREFIX, Value: cru- }
@@ -263,6 +264,7 @@ Resources:
             - { Name: NAMESPACE_MODE, Value: !Ref NamespaceMode }
             - { Name: TABLE_NAME, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-TableName" } }
             - { Name: TABLE_INSTANCE_INDEX, Value: by-instance }
+            - { Name: SERVICE_PORTS, Value: !Sub "a=${PortA},b=${PortB},c=${PortC}" }
             - { Name: RECONCILE_SECONDS, Value: "30" }
             - { Name: DISCOVERY_TTL_SECONDS, Value: "5" }
           HealthCheck:
@@ -359,8 +361,12 @@ Resources:
             - { "Fn::ImportValue": !Sub "${BaseStackName}-SgC" }
       LoadBalancers:
         - { ContainerName: app, ContainerPort: !Ref PortC, TargetGroupArn: !Ref DirectorTargetGroup }
-      ServiceRegistries:
-        - { RegistryArn: !GetAtt SdServiceC.Arn, ContainerName: app, ContainerPort: !Ref PortC }
+      # DNS mode: SRV records need the port. HTTP mode: ECS rejects a port, so it
+      # registers the task IP only and the app uses SERVICE_PORTS for the port.
+      ServiceRegistries: !If
+        - IsDns
+        - - { RegistryArn: !GetAtt SdServiceC.Arn, ContainerName: app, ContainerPort: !Ref PortC }
+        - - { RegistryArn: !GetAtt SdServiceC.Arn }
       Tags:
         - { Key: AppCatID, Value: !Ref AppCatID }
         - { Key: Description, Value: Service C director }
@@ -388,8 +394,12 @@ Resources:
           Subnets: !Ref SubnetIds
           SecurityGroups:
             - { "Fn::ImportValue": !Sub "${BaseStackName}-SgB" }
-      ServiceRegistries:
-        - { RegistryArn: !GetAtt SdServiceB.Arn, ContainerName: app, ContainerPort: !Ref PortB }
+      # DNS mode: SRV records need the port. HTTP mode: ECS rejects a port, so it
+      # registers the task IP only and the app uses SERVICE_PORTS for the port.
+      ServiceRegistries: !If
+        - IsDns
+        - - { RegistryArn: !GetAtt SdServiceB.Arn, ContainerName: app, ContainerPort: !Ref PortB }
+        - - { RegistryArn: !GetAtt SdServiceB.Arn }
       Tags:
         - { Key: AppCatID, Value: !Ref AppCatID }
         - { Key: Description, Value: Service B worker }
@@ -418,8 +428,12 @@ Resources:
           Subnets: !Ref SubnetIds
           SecurityGroups:
             - { "Fn::ImportValue": !Sub "${BaseStackName}-SgA" }
-      ServiceRegistries:
-        - { RegistryArn: !GetAtt SdServiceA.Arn, ContainerName: app, ContainerPort: !Ref PortA }
+      # DNS mode: SRV records need the port. HTTP mode: ECS rejects a port, so it
+      # registers the task IP only and the app uses SERVICE_PORTS for the port.
+      ServiceRegistries: !If
+        - IsDns
+        - - { RegistryArn: !GetAtt SdServiceA.Arn, ContainerName: app, ContainerPort: !Ref PortA }
+        - - { RegistryArn: !GetAtt SdServiceA.Arn }
       Tags:
         - { Key: AppCatID, Value: !Ref AppCatID }
         - { Key: Description, Value: Service A caller }
