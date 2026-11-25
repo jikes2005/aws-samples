@@ -1,0 +1,433 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cloud Map sticky routing POC - services stack. Three Fargate services
+  registered in Cloud Map with A + SRV records (task IP and port):
+  A = caller, B = worker (many tasks), C = director behind an internal NLB.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: av-ecs-cm-poc
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+  BaseStackName:
+    Type: String
+    Default: av-ecs-cm-poc-base
+    Description: Name of the deployed 01-base.yaml stack.
+  NamespaceMode:
+    Type: String
+    Default: DNS
+    AllowedValues: [DNS, HTTP]
+    Description: Must match NamespaceMode used in the base stack.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for tasks and the internal NLB (2 or 3 AZs).
+  ImageTag:
+    Type: String
+    Default: v1
+  PortA:
+    Type: Number
+    Default: 8080
+    MinValue: 7000
+    MaxValue: 9999
+  PortB:
+    Type: Number
+    Default: 9000
+    MinValue: 7000
+    MaxValue: 9999
+  PortC:
+    Type: Number
+    Default: 7000
+    MinValue: 7000
+    MaxValue: 9999
+  DesiredCountA:
+    Type: Number
+    Default: 1
+  DesiredCountB:
+    Type: Number
+    Default: 3
+  DesiredCountC:
+    Type: Number
+    Default: 2
+  ClientCount:
+    Type: Number
+    Default: 10
+    Description: Number of simulated clients (cru-001 ...) service A drives.
+  LoopSeconds:
+    Type: Number
+    Default: 20
+    Description: Seconds between service A rounds. 0 disables the loop (use /run).
+  AppCatID:
+    Type: String
+    Default: "000000"
+  ServiceNameTag:
+    Type: String
+    Default: av-ecs-cm-poc
+  SupportTeam:
+    Type: String
+    Default: cloud-architecture
+  Environment:
+    Type: String
+    Default: lab
+
+Conditions:
+  IsDns: !Equals [!Ref NamespaceMode, DNS]
+
+Resources:
+  # ------------------------------------------------------------------ Cloud Map services
+  # DNS mode: A + SRV records. The SRV target is <task-id>.<service>.<namespace>,
+  # and Cloud Map creates an A record for that name, so every task gets its own hostname.
+  # HealthCheckCustomConfig lets ECS push container health into Cloud Map.
+  SdServiceA:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: a
+      NamespaceId: { "Fn::ImportValue": !Sub "${BaseStackName}-NamespaceId" }
+      Description: Service A caller
+      DnsConfig: !If
+        - IsDns
+        - RoutingPolicy: MULTIVALUE
+          DnsRecords:
+            - { Type: A, TTL: 10 }
+            - { Type: SRV, TTL: 10 }
+        - !Ref AWS::NoValue
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Cloud Map service a }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SdServiceB:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: b
+      NamespaceId: { "Fn::ImportValue": !Sub "${BaseStackName}-NamespaceId" }
+      Description: Service B worker
+      DnsConfig: !If
+        - IsDns
+        - RoutingPolicy: MULTIVALUE
+          DnsRecords:
+            - { Type: A, TTL: 10 }
+            - { Type: SRV, TTL: 10 }
+        - !Ref AWS::NoValue
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Cloud Map service b }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SdServiceC:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: c
+      NamespaceId: { "Fn::ImportValue": !Sub "${BaseStackName}-NamespaceId" }
+      Description: Service C director
+      DnsConfig: !If
+        - IsDns
+        - RoutingPolicy: MULTIVALUE
+          DnsRecords:
+            - { Type: A, TTL: 10 }
+            - { Type: SRV, TTL: 10 }
+        - !Ref AWS::NoValue
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Cloud Map service c }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ Task definitions
+  TaskDefA:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-a
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
+      TaskRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskRoleAArn" }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${BaseStackName}-RepositoryUri" }
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - { Name: a-http, ContainerPort: !Ref PortA, Protocol: tcp }
+          Environment:
+            - { Name: SERVICE_ROLE, Value: a }
+            - { Name: PORT, Value: !Ref PortA }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: NAMESPACE_NAME, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-NamespaceName" } }
+            - { Name: NAMESPACE_MODE, Value: !Ref NamespaceMode }
+            - { Name: TARGET_SERVICE, Value: b }
+            - { Name: DIRECTOR_SERVICE, Value: c }
+            - { Name: CLIENT_COUNT, Value: !Ref ClientCount }
+            - { Name: CLIENT_PREFIX, Value: cru- }
+            - { Name: LOOP_SECONDS, Value: !Ref LoopSeconds }
+            - { Name: PREFER_HOSTNAME, Value: !If [IsDns, "true", "false"] }
+          HealthCheck:
+            Command: ["CMD", "python", "/app/healthcheck.py"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: { "Fn::ImportValue": !Sub "${BaseStackName}-LogGroupA" }
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: a
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service A caller task definition }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  TaskDefB:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-b
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
+      TaskRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskRoleBArn" }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${BaseStackName}-RepositoryUri" }
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - { Name: b-http, ContainerPort: !Ref PortB, Protocol: tcp }
+          Environment:
+            - { Name: SERVICE_ROLE, Value: b }
+            - { Name: PORT, Value: !Ref PortB }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          HealthCheck:
+            Command: ["CMD", "python", "/app/healthcheck.py"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: { "Fn::ImportValue": !Sub "${BaseStackName}-LogGroupB" }
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: b
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service B worker task definition }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  TaskDefC:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-c
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
+      TaskRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskRoleCArn" }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: { "Fn::ImportValue": !Sub "${BaseStackName}-RepositoryUri" }
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - { Name: c-http, ContainerPort: !Ref PortC, Protocol: tcp }
+          Environment:
+            - { Name: SERVICE_ROLE, Value: c }
+            - { Name: PORT, Value: !Ref PortC }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: NAMESPACE_NAME, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-NamespaceName" } }
+            - { Name: NAMESPACE_MODE, Value: !Ref NamespaceMode }
+            - { Name: TABLE_NAME, Value: { "Fn::ImportValue": !Sub "${BaseStackName}-TableName" } }
+            - { Name: TABLE_INSTANCE_INDEX, Value: by-instance }
+            - { Name: RECONCILE_SECONDS, Value: "30" }
+            - { Name: DISCOVERY_TTL_SECONDS, Value: "5" }
+          HealthCheck:
+            Command: ["CMD", "python", "/app/healthcheck.py"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: { "Fn::ImportValue": !Sub "${BaseStackName}-LogGroupC" }
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: c
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service C director task definition }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ Director NLB (internal)
+  DirectorNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-dir
+      Type: network
+      Scheme: internal
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - { "Fn::ImportValue": !Sub "${BaseStackName}-SgNlb" }
+      LoadBalancerAttributes:
+        - { Key: load_balancing.cross_zone.enabled, Value: "true" }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Internal NLB for the director }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DirectorTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-dir
+      Port: !Ref PortC
+      Protocol: TCP
+      TargetType: ip
+      VpcId: { "Fn::ImportValue": !Sub "${BaseStackName}-VpcId" }
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "15" }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director target group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DirectorListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DirectorNlb
+      Port: !Ref PortC
+      Protocol: TCP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref DirectorTargetGroup }
+
+  # ------------------------------------------------------------------ ECS services
+  ServiceC:
+    Type: AWS::ECS::Service
+    DependsOn: DirectorListener
+    Properties:
+      ServiceName: !Sub ${ProjectName}-c
+      Cluster: { "Fn::ImportValue": !Sub "${BaseStackName}-ClusterName" }
+      TaskDefinition: !Ref TaskDefC
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCountC
+      HealthCheckGracePeriodSeconds: 30
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - { "Fn::ImportValue": !Sub "${BaseStackName}-SgC" }
+      LoadBalancers:
+        - { ContainerName: app, ContainerPort: !Ref PortC, TargetGroupArn: !Ref DirectorTargetGroup }
+      ServiceRegistries:
+        - { RegistryArn: !GetAtt SdServiceC.Arn, ContainerName: app, ContainerPort: !Ref PortC }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service C director }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ServiceB:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-b
+      Cluster: { "Fn::ImportValue": !Sub "${BaseStackName}-ClusterName" }
+      TaskDefinition: !Ref TaskDefB
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCountB
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - { "Fn::ImportValue": !Sub "${BaseStackName}-SgB" }
+      ServiceRegistries:
+        - { RegistryArn: !GetAtt SdServiceB.Arn, ContainerName: app, ContainerPort: !Ref PortB }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service B worker }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ServiceA:
+    Type: AWS::ECS::Service
+    DependsOn: [ServiceB, ServiceC]
+    Properties:
+      ServiceName: !Sub ${ProjectName}-a
+      Cluster: { "Fn::ImportValue": !Sub "${BaseStackName}-ClusterName" }
+      TaskDefinition: !Ref TaskDefA
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCountA
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - { "Fn::ImportValue": !Sub "${BaseStackName}-SgA" }
+      ServiceRegistries:
+        - { RegistryArn: !GetAtt SdServiceA.Arn, ContainerName: app, ContainerPort: !Ref PortA }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service A caller }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+Outputs:
+  DirectorUrl:
+    Description: Director via the internal NLB (use from the test client)
+    Value: !Sub "http://${DirectorNlb.DNSName}:${PortC}"

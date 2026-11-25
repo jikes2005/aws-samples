@@ -1,0 +1,523 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cloud Map sticky routing POC - base stack. KMS key, ECR repository, DynamoDB
+  client-to-task mapping table, Cloud Map namespace, ECS cluster, log groups,
+  IAM roles and security groups. Uses an existing VPC, subnets and VPC
+  endpoints. Deploy before 02-services.yaml.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Project }
+        Parameters: [ProjectName, NamespaceName, NamespaceMode]
+      - Label: { default: Network }
+        Parameters: [VpcId, ClientCidr]
+      - Label: { default: Data }
+        Parameters: [TableDeletionProtection, LogRetentionDays]
+      - Label: { default: Required tags }
+        Parameters: [AppCatID, ServiceNameTag, SupportTeam, Environment]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: av-ecs-cm-poc
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: Lowercase name used as a prefix for every resource.
+  NamespaceName:
+    Type: String
+    Default: poc.internal
+    Description: Cloud Map namespace. In DNS mode tasks resolve as <service>.<namespace>.
+  NamespaceMode:
+    Type: String
+    Default: DNS
+    AllowedValues: [DNS, HTTP]
+    Description: >-
+      DNS creates a private DNS namespace (Route 53 private hosted zone, DNS + API
+      discovery). HTTP creates an API-only namespace (no hosted zone) - use it if
+      hosted zone creation is restricted in your account.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  ClientCidr:
+    Type: String
+    Default: 10.0.0.0/8
+    Description: CIDR of test clients (notebook, simulated CRUs) allowed to reach the director NLB and worker tasks.
+  TableDeletionProtection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false (stack update) before deleting the stack.
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+  AppCatID:
+    Type: String
+    Default: "000000"
+  ServiceNameTag:
+    Type: String
+    Default: av-ecs-cm-poc
+  SupportTeam:
+    Type: String
+    Default: cloud-architecture
+  Environment:
+    Type: String
+    Default: lab
+
+Conditions:
+  IsDns: !Equals [!Ref NamespaceMode, DNS]
+  IsHttp: !Equals [!Ref NamespaceMode, HTTP]
+
+Resources:
+  # ------------------------------------------------------------------ KMS
+  KmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub ${ProjectName} key for DynamoDB ECR and CloudWatch Logs
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${ProjectName}/*"
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: POC customer managed key }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  KmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${ProjectName}
+      TargetKeyId: !Ref KmsKey
+
+  # ------------------------------------------------------------------ ECR
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}/app
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: POC image for services a b c }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ DynamoDB mapping table
+  MappingTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub ${ProjectName}-client-mapping
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !Ref TableDeletionProtection
+      AttributeDefinitions:
+        - { AttributeName: client_id, AttributeType: S }
+        - { AttributeName: instance_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: client_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by-instance
+          KeySchema:
+            - { AttributeName: instance_id, KeyType: HASH }
+          Projection: { ProjectionType: KEYS_ONLY }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Client to task mapping for sticky routing }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: dynamodbbackup, Value: "True" }
+
+  # ------------------------------------------------------------------ Cloud Map namespace
+  DnsNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Condition: IsDns
+    Properties:
+      Name: !Ref NamespaceName
+      Vpc: !Ref VpcId
+      Description: !Sub ${ProjectName} private DNS namespace
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Cloud Map private DNS namespace }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  HttpNamespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Condition: IsHttp
+    Properties:
+      Name: !Ref NamespaceName
+      Description: !Sub ${ProjectName} API only namespace
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Cloud Map HTTP namespace }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ ECS cluster and logs
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: POC Fargate cluster }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  LogGroupA:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/service-a
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service A caller logs }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  LogGroupB:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/service-b
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service B worker logs }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  LogGroupC:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/service-c
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service C director logs }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ IAM
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: kms-decrypt-image
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:DescribeKey]
+                Resource: !GetAtt KmsKey.Arn
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: ECS task execution role }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  TaskRoleA:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cloudmap-discover
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [servicediscovery:DiscoverInstances, servicediscovery:DiscoverInstancesRevision]
+                Resource: "*"
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service A caller task role }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  TaskRoleB:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service B worker task role no AWS API access }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  TaskRoleC:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: director
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudMapDiscover
+                Effect: Allow
+                Action: [servicediscovery:DiscoverInstances, servicediscovery:DiscoverInstancesRevision]
+                Resource: "*"
+              - Sid: MappingTable
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt MappingTable.Arn
+                  - !Sub "${MappingTable.Arn}/index/*"
+              - Sid: TableKey
+                Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey*, kms:DescribeKey, kms:CreateGrant]
+                Resource: !GetAtt KmsKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub dynamodb.${AWS::Region}.amazonaws.com
+      Tags:
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service C director task role }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ Security groups
+  SgNlb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Director NLB
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-nlb" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Director NLB security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SgA:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Service A caller tasks
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-svc-a" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service A security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SgB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Service B worker tasks
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-svc-b" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service B security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SgC:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Service C director tasks
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-svc-c" }
+        - { Key: AppCatID, Value: !Ref AppCatID }
+        - { Key: Description, Value: Service C security group }
+        - { Key: ServiceName, Value: !Ref ServiceNameTag }
+        - { Key: Support-Team, Value: !Ref SupportTeam }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # Ports are opened as a small range (7000-9999) so the services stack can
+  # pick any container port in it without changing this stack.
+  NlbFromClients:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgNlb
+      IpProtocol: tcp
+      FromPort: 7000
+      ToPort: 9999
+      CidrIp: !Ref ClientCidr
+      Description: Test clients to director NLB
+
+  AFromClients:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgA
+      IpProtocol: tcp
+      FromPort: 7000
+      ToPort: 9999
+      CidrIp: !Ref ClientCidr
+      Description: Test clients to service A run endpoint
+
+  BFromA:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgB
+      IpProtocol: tcp
+      FromPort: 7000
+      ToPort: 9999
+      SourceSecurityGroupId: !Ref SgA
+      Description: Service A to worker tasks
+
+  BFromClients:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgB
+      IpProtocol: tcp
+      FromPort: 7000
+      ToPort: 9999
+      CidrIp: !Ref ClientCidr
+      Description: Simulated CRU clients direct to worker tasks
+
+  CFromA:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgC
+      IpProtocol: tcp
+      FromPort: 7000
+      ToPort: 9999
+      SourceSecurityGroupId: !Ref SgA
+      Description: Service A to director
+
+  CFromNlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgC
+      IpProtocol: tcp
+      FromPort: 7000
+      ToPort: 9999
+      SourceSecurityGroupId: !Ref SgNlb
+      Description: Director NLB to director tasks
+
+Outputs:
+  # Consumed by 02-services.yaml via Fn::ImportValue (RepositoryUri also used by build_push.sh)
+  VpcId:
+    Value: !Ref VpcId
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+    Export: { Name: !Sub "${AWS::StackName}-RepositoryUri" }
+  TableName:
+    Value: !Ref MappingTable
+    Export: { Name: !Sub "${AWS::StackName}-TableName" }
+  NamespaceId:
+    Value: !If [IsDns, !Ref DnsNamespace, !Ref HttpNamespace]
+    Export: { Name: !Sub "${AWS::StackName}-NamespaceId" }
+  NamespaceName:
+    Value: !Ref NamespaceName
+    Export: { Name: !Sub "${AWS::StackName}-NamespaceName" }
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${AWS::StackName}-ClusterName" }
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export: { Name: !Sub "${AWS::StackName}-TaskExecutionRoleArn" }
+  TaskRoleAArn:
+    Value: !GetAtt TaskRoleA.Arn
+    Export: { Name: !Sub "${AWS::StackName}-TaskRoleAArn" }
+  TaskRoleBArn:
+    Value: !GetAtt TaskRoleB.Arn
+    Export: { Name: !Sub "${AWS::StackName}-TaskRoleBArn" }
+  TaskRoleCArn:
+    Value: !GetAtt TaskRoleC.Arn
+    Export: { Name: !Sub "${AWS::StackName}-TaskRoleCArn" }
+  SgNlbId:
+    Value: !Ref SgNlb
+    Export: { Name: !Sub "${AWS::StackName}-SgNlb" }
+  SgAId:
+    Value: !Ref SgA
+    Export: { Name: !Sub "${AWS::StackName}-SgA" }
+  SgBId:
+    Value: !Ref SgB
+    Export: { Name: !Sub "${AWS::StackName}-SgB" }
+  SgCId:
+    Value: !Ref SgC
+    Export: { Name: !Sub "${AWS::StackName}-SgC" }
+  LogGroupA:
+    Value: !Ref LogGroupA
+    Export: { Name: !Sub "${AWS::StackName}-LogGroupA" }
+  LogGroupB:
+    Value: !Ref LogGroupB
+    Export: { Name: !Sub "${AWS::StackName}-LogGroupB" }
+  LogGroupC:
+    Value: !Ref LogGroupC
+    Export: { Name: !Sub "${AWS::StackName}-LogGroupC" }
