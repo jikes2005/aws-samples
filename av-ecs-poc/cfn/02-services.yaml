@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Services stack for PoC
+Description: Services stack for PoC.
 
 Parameters:
   ProjectName:
@@ -12,6 +12,11 @@ Parameters:
   ImageTag:
     Type: String
     Default: v1
+  CpuArchitecture:
+    Type: String
+    Default: X86_64
+    AllowedValues: [X86_64, ARM64]
+    Description: Must match the image architecture (linux/amd64 = X86_64, linux/arm64 = ARM64).
   DirectorCount:
     Type: Number
     Default: 2
@@ -66,7 +71,7 @@ Resources:
       Memory: "512"
       NetworkMode: awsvpc
       RequiresCompatibilities: [FARGATE]
-      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      RuntimePlatform: { CpuArchitecture: !Ref CpuArchitecture, OperatingSystemFamily: LINUX }
       ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
       TaskRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-RegistryTaskRoleArn" }
       ContainerDefinitions:
@@ -113,7 +118,7 @@ Resources:
       Memory: "1024"
       NetworkMode: awsvpc
       RequiresCompatibilities: [FARGATE]
-      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      RuntimePlatform: { CpuArchitecture: !Ref CpuArchitecture, OperatingSystemFamily: LINUX }
       ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
       TaskRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-RegistryTaskRoleArn" }
       ContainerDefinitions:
@@ -163,7 +168,7 @@ Resources:
       Memory: "1024"
       NetworkMode: awsvpc
       RequiresCompatibilities: [FARGATE]
-      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      RuntimePlatform: { CpuArchitecture: !Ref CpuArchitecture, OperatingSystemFamily: LINUX }
       ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
       ContainerDefinitions:
         - Name: app
@@ -213,7 +218,7 @@ Resources:
       Memory: "512"
       NetworkMode: awsvpc
       RequiresCompatibilities: [FARGATE]
-      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      RuntimePlatform: { CpuArchitecture: !Ref CpuArchitecture, OperatingSystemFamily: LINUX }
       ExecutionRoleArn: { "Fn::ImportValue": !Sub "${BaseStackName}-TaskExecutionRoleArn" }
       ContainerDefinitions:
         - Name: app

@@ -10,8 +10,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} -r requirements.txt
 
 COPY app.py healthcheck.py entrypoint.sh ./
-RUN chmod 755 /app/entrypoint.sh && useradd --uid 10001 --no-create-home appuser
+# Strip Windows line endings / UTF-8 BOM (files edited or unzipped on Windows), then
+# run the script through sh so the kernel never has to parse its shebang line.
+RUN sed -i '1s/^\xEF\xBB\xBF//; s/\r$//' /app/entrypoint.sh /app/app.py /app/healthcheck.py \
+ && chmod 755 /app/entrypoint.sh && useradd --uid 10001 --no-create-home appuser
 USER 10001
 
 # ROLE = director | server | guard | agent (set per task definition)
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/bin/sh", "/app/entrypoint.sh"]

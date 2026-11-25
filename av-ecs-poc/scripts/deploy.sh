@@ -1,4 +1,4 @@
-
+#!/usr/bin/env bash
 set -euo pipefail
 REGION="${AWS_REGION:-us-east-1}"
 PROJECT="${PROJECT:-av-ecs-poc}"
