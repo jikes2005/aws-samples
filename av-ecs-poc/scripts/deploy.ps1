@@ -30,7 +30,8 @@ if ($Build) {
   $repo = aws cloudformation describe-stacks --region $Region --stack-name $baseStack `
     --query "Stacks[0].Outputs[?OutputKey=='RepositoryUri'].OutputValue" --output text
   aws ecr get-login-password --region $Region | docker login --username AWS --password-stdin $repo.Split("/")[0]
-  docker build --platform linux/amd64 -t "${repo}:$Tag" "$root\app"
+  docker build --platform linux/amd64 -t "${Project}-vendor:$Tag" "$root\app"
+  docker build --platform linux/amd64 --build-arg "VENDOR_IMAGE=${Project}-vendor:$Tag" -t "${repo}:$Tag" "$root\wrapper"
   docker push "${repo}:$Tag"
 } elseif ($Stage -eq "all") {
   Read-Host "Build and push image tag '$Tag' (notebooks\build_push_image.ipynb), then press Enter"

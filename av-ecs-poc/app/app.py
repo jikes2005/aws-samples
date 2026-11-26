@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, urlparse
 ROLE = os.environ.get("ROLE", "server").lower()
 REGION = os.environ.get("AWS_REGION", "")
 CMD_TIMEOUT = float(os.environ.get("CMD_TIMEOUT_SECONDS", "330"))
+# POC test hooks: the Director page can make a server or guard task exit (ECS then replaces it)
+ADMIN_ACTIONS = os.environ.get("ADMIN_ACTIONS", "true").lower() == "true"
 
 
 def now_iso():
@@ -188,6 +190,10 @@ def http_json(method, url, body=None, timeout=10.0):
             return e.code, {"error": str(e)}
 
 
+class Html(str):
+    """Return Html(...) from a route to send text/html instead of JSON."""
+
+
 class Handler(BaseHTTPRequestHandler):
     routes = []  # (method, path prefix, fn(handler, parts, query, body) -> (code, payload))
     protocol_version = "HTTP/1.1"
@@ -196,9 +202,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, payload):
-        raw = json.dumps(payload, default=str).encode()
+        is_html = isinstance(payload, Html)
+        raw = payload.encode() if is_html else json.dumps(payload, default=str).encode()
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/html; charset=utf-8" if is_html else "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -215,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._send(400, {"error": "invalid json"})
         for m, prefix, fn in self.routes:
-            if m == method and u.path.startswith(prefix):
+            if m == method and u.path.startswith(prefix) and (prefix != "/" or u.path == "/"):
                 try:
                     return self._send(*fn(self, parts, query, body))
                 except Exception as exc:
@@ -250,7 +257,9 @@ def every(seconds, fn):
 
 
 # =========================================================================== SERVER
-SERVER_NAME = os.environ.get("NG_SERVER_NAME") or socket.gethostname()  # set by entrypoint.sh
+# Like the vendor image: the address comes from the environment (default: host name).
+# On ECS it is set by the wrapper entrypoint (wrapper/entrypoint.sh) to the task IP.
+SERVER_NAME = os.environ.get("NG_SERVER_NAME") or socket.gethostname()
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8261"))
 
 
@@ -368,11 +377,36 @@ def server_command(h, parts, q, b):
         return 409, {"error": f"device {dev} offline", "trace": trace}
     req = {"request_id": uuid.uuid4().hex[:8], "cmd": b.get("cmd", "status"), "delay": float(b.get("delay", 0))}
     t0 = time.time()
-    res = guard_call(d["guard_address"], d["guard_port"], req, timeout=CMD_TIMEOUT)
+    try:
+        res = guard_call(d["guard_address"], d["guard_port"], req, timeout=CMD_TIMEOUT)
+    except OSError as exc:
+        return 502, {"error": f"guard {d['guard_address']}:{d['guard_port']} unreachable ({exc}) - "
+                              "the agent tunnel is probably reconnecting", "trace": trace}
     trace += res.pop("trace", [])
     log("command_done", device_id=dev, guard=f"{d['guard_address']}:{d['guard_port']}",
         cmd=req["cmd"], ms=int((time.time() - t0) * 1000))
     return 200, {"device_id": dev, "result": res.get("result"), "error": res.get("error"), "trace": trace}
+
+
+def exit_soon(reason):
+    log("exiting_on_request", reason=reason)
+    threading.Timer(0.5, lambda: os._exit(1)).start()
+
+
+def server_exit(h, parts, q, b):
+    """POC hook: Director -> this server (task IP). The task exits and ECS replaces it."""
+    if not ADMIN_ACTIONS:
+        return 403, {"error": "admin actions disabled"}
+    exit_soon("crash requested from the test page")
+    return 200, {"exiting": ME["task_id"]}
+
+
+def server_crash_guard(h, parts, q, b):
+    """POC hook: Director -> server -> one specific guard, on a device port it advertised."""
+    if not ADMIN_ACTIONS:
+        return 403, {"error": "admin actions disabled"}
+    res = guard_call(b["guard_address"], b["guard_port"], {"request_id": "admin", "admin": "exit"}, timeout=10)
+    return 200, {"guard": f"{b['guard_address']}:{b['guard_port']}", "reply": res}
 
 
 def run_server():
@@ -385,6 +419,8 @@ def run_server():
         ("POST", "/internal/devices/register", server_register_device),
         ("POST", "/internal/devices/unregister", server_unregister_device),
         ("POST", "/internal/devices/adopt", server_adopt),
+        ("POST", "/internal/exit", server_exit),
+        ("POST", "/internal/crash-guard", server_crash_guard),
         ("POST", "/devices/", server_command),
     ])
 
@@ -440,6 +476,29 @@ def director_command(h, parts, q, b):
     return code, res
 
 
+def director_crash_server(h, parts, q, b):
+    """POST /admin/servers/<id>/crash -> tell that server (by task IP) to exit."""
+    srv = get_server(parts[2]) if len(parts) > 2 else None
+    if not srv:
+        return 404, {"error": "unknown server"}
+    return http_json("POST", f"http://{srv['address']}:{srv['port']}/internal/exit", {}, timeout=5)
+
+
+def director_crash_guard(h, parts, q, b):
+    """POST /admin/guards/<id>/crash -> via a server (only servers may reach guard device ports)."""
+    gid = parts[2] if len(parts) > 2 else ""
+    dev = next((d for d in scan(tables()[1]) if d.get("guard_id") == gid and d.get("online")), None)
+    srv = get_server(dev["owner_server_id"]) if dev else None
+    if not srv:
+        return 404, {"error": "no online device on that guard"}
+    return http_json("POST", f"http://{srv['address']}:{srv['port']}/internal/crash-guard",
+                     {"guard_address": dev["guard_address"], "guard_port": dev["guard_port"]}, timeout=15)
+
+
+def director_page(h, parts, q, b):
+    return 200, Html(TEST_PAGE)
+
+
 def run_director():
     wait_for_registry()
     serve_http(DIRECTOR_PORT, [
@@ -447,11 +506,14 @@ def run_director():
         ("GET", "/servers", director_servers),
         ("GET", "/devices", director_devices),
         ("POST", "/devices/", director_command),
+        ("POST", "/admin/servers/", director_crash_server),
+        ("POST", "/admin/guards/", director_crash_guard),
+        ("GET", "/", director_page),
     ])
 
 
 # =========================================================================== GUARD
-GUARD_IP = os.environ.get("GUARD_EXTERNAL_IP") or ME["ip"]  # set by entrypoint.sh
+GUARD_IP = os.environ.get("GUARD_EXTERNAL_IP") or socket.gethostname()  # set by wrapper/entrypoint.sh
 GUARD_API_ROOT = os.environ.get("GUARD_API_ROOT", "http://ng-server:8261").rstrip("/")
 TUNNEL_PORT = int(os.environ.get("TUNNEL_PORT", "9000"))
 PORT_MIN = int(os.environ.get("DEVICE_PORT_MIN", "10000"))
@@ -478,7 +540,7 @@ USED_PORTS = set()
 
 async def guard_post(path, body):
     loop = asyncio.get_running_loop()
-    for attempt in range(10):
+    for attempt in range(60):  # keep trying for ~2 minutes (servers may be restarting)
         try:
             return await loop.run_in_executor(None, lambda: http_json("POST", GUARD_API_ROOT + path, body, 10))
         except Exception as exc:
@@ -494,6 +556,12 @@ async def guard_device_conn(tunnel, reader, writer):
         if not line:
             return
         req = json.loads(line)
+        if req.get("admin") == "exit" and ADMIN_ACTIONS:   # POC hook from the test page
+            writer.write((json.dumps({"exiting": ME["task_id"]}) + "\n").encode())
+            await writer.drain()
+            log("exiting_on_request", reason="crash requested from the test page")
+            asyncio.get_running_loop().call_later(0.5, os._exit, 1)
+            return
         fut = asyncio.get_running_loop().create_future()
         tunnel.pending[req["request_id"]] = fut
         await tunnel.send({"type": "cmd", **req})
@@ -627,6 +695,187 @@ async def agent_main():
     n = int(os.environ.get("AGENT_DEVICES", "10"))
     prefix = os.environ.get("AGENT_PREFIX", "dev-")
     await asyncio.gather(*(agent_device(f"{prefix}{i:03d}", targets) for i in range(1, n + 1)))
+
+
+# =========================================================================== TEST PAGE (served by the Director at /)
+TEST_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>av-ecs-poc test console</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2430; --muted:#667085; --line:#e4e7ec; --ok:#12805c; --bad:#c0362c; --acc:#2f5bd3; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--ink); background:var(--bg); }
+  header { padding:16px 24px; background:var(--card); border-bottom:1px solid var(--line); display:flex; gap:24px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .meta { color:var(--muted); }
+  main { padding:20px 24px; display:grid; gap:20px; grid-template-columns: 1fr 1fr; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; min-width:0; }
+  section.wide { grid-column: 1 / -1; }
+  h2 { font-size:15px; margin:0 0 4px; }
+  p.hint { margin:0 0 12px; color:var(--muted); font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:middle; white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; }
+  code, .mono { font-family: ui-monospace, Consolas, monospace; font-size:12.5px; }
+  button { font:inherit; font-size:12.5px; padding:4px 10px; border-radius:6px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+  button:hover { border-color:var(--acc); color:var(--acc); }
+  button.primary { background:var(--acc); color:#fff; border-color:var(--acc); }
+  button.primary:hover { color:#fff; opacity:.9; }
+  button.danger:hover { border-color:var(--bad); color:var(--bad); }
+  button:disabled { opacity:.5; cursor:wait; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+  .pill.ok { background:#e6f4ee; color:var(--ok); } .pill.bad { background:#fbeaea; color:var(--bad); }
+  .path { display:flex; gap:4px; align-items:center; flex-wrap:wrap; }
+  .hop { border:1px solid var(--line); border-radius:6px; padding:2px 6px; background:#fafbfc; }
+  .hop b { font-weight:600; margin-right:4px; }
+  .arrow { color:var(--muted); }
+  .toolbar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  .toolbar input { width:70px; padding:4px 6px; border:1px solid var(--line); border-radius:6px; font:inherit; }
+  #log { max-height:220px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; background:#0f1720; color:#d6e2f0; border-radius:6px; padding:10px; margin:0; }
+  .changed { color:var(--bad); font-weight:600; }
+  .scroll { overflow-x:auto; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>av-ecs-poc test console</h1>
+  <span class="meta">Page served by Director <b id="dirTask" class="mono">…</b> at <span id="dirIp" class="mono">…</span> (NLB picks any Director)</span>
+  <label class="meta"><input type="checkbox" id="auto" checked> auto-refresh</label>
+</header>
+<main>
+  <section>
+    <h2>NG servers</h2>
+    <p class="hint">Each server registered its own task IP as NG_SERVER_NAME:8261. "Crash" makes the task exit; ECS replaces it with a new IP and its devices are rehomed after ~30 s.</p>
+    <div class="scroll"><table id="servers"></table></div>
+  </section>
+  <section>
+    <h2>Guards</h2>
+    <p class="hint">Guards that hold device tunnels, from the registry. "Crash" stops one; its agents reconnect through the NLB to another Guard.</p>
+    <div class="scroll"><table id="guards"></table></div>
+  </section>
+  <section class="wide">
+    <h2>Devices</h2>
+    <div class="toolbar">
+      <button class="primary" id="sweepBtn">Command all devices</button>
+      <span class="meta">delay (s)</span><input type="number" id="delay" value="0" min="0" max="320">
+      <span class="hint">Use a delay of 310 to test a 300 s+ operation through every hop.</span>
+    </div>
+    <div class="scroll"><table id="devices"></table></div>
+  </section>
+  <section class="wide">
+    <h2>Activity</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script>
+// Relative URLs, so the page also works behind a path prefix (e.g. a Jupyter /proxy/11000/ URL)
+const $ = (id) => document.getElementById(id);
+const short = (s) => (s || "").slice(0, 12);
+const lastPath = {};
+const lastResult = {};
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent = `${t}  ${msg}\n` + $("log").textContent;
+}
+
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: { "Content-Type": "application/json" },
+                                body: body ? JSON.stringify(body) : undefined });
+  let data = {};
+  try { data = await r.json(); } catch (e) { data = { error: `HTTP ${r.status}` }; }
+  return { status: r.status, data };
+}
+
+function pathHtml(trace) {
+  if (!trace || !trace.length) return "";
+  return '<span class="path">' + trace.map((h) => {
+    const where = h.endpoint || h.ip || "";
+    const extra = h.hop === "agent" ? (h.device || "") : where;
+    return `<span class="hop"><b>${h.hop}</b><span class="mono">${extra}</span>${h.note ? " (fwd)" : ""}</span>`;
+  }).join('<span class="arrow">→</span>') + "</span>";
+}
+
+function pathKey(trace) { return (trace || []).map((h) => `${h.hop}@${h.endpoint || h.ip}`).join(">"); }
+
+async function refresh() {
+  const [h, s, d] = await Promise.all([api("GET", "healthz"), api("GET", "servers"), api("GET", "devices")]);
+  $("dirTask").textContent = short(h.data.task); $("dirIp").textContent = h.data.ip || "";
+
+  const servers = s.data.servers || [];
+  $("servers").innerHTML = "<tr><th>Server</th><th>NG_SERVER_NAME:port</th><th>AZ</th><th>Status</th><th>Devices</th><th>Last heartbeat</th><th></th></tr>" +
+    servers.map((x) => `<tr><td class="mono">${short(x.server_id)}</td><td class="mono">${x.address}:${x.port}</td><td>${x.az || ""}</td>
+      <td>${x.live ? '<span class="pill ok">live</span>' : '<span class="pill bad">gone</span>'}</td><td>${x.devices}</td>
+      <td class="mono">${(x.last_heartbeat || "").slice(11, 19)}</td>
+      <td>${x.live ? `<button class="danger" onclick="crashServer('${x.server_id}')">Crash</button>` : ""}</td></tr>`).join("");
+
+  const devices = d.data.devices || [];
+  const guards = {};
+  devices.forEach((x) => { if (x.online && x.guard_id) { const g = guards[x.guard_id] ||= { ip: x.guard_endpoint.split(":")[0], n: 0 }; g.n++; } });
+  $("guards").innerHTML = "<tr><th>Guard</th><th>GUARD_EXTERNAL_IP</th><th>Tunnels</th><th></th></tr>" +
+    Object.entries(guards).map(([id, g]) => `<tr><td class="mono">${short(id)}</td><td class="mono">${g.ip}</td><td>${g.n}</td>
+      <td><button class="danger" onclick="crashGuard('${id}')">Crash</button></td></tr>`).join("");
+
+  $("devices").innerHTML = "<tr><th>Device</th><th>Status</th><th>Owner server</th><th>Guard endpoint</th><th>Rehomed</th><th></th><th>Last command path</th><th>ms</th></tr>" +
+    devices.map((x) => { const r = lastResult[x.device_id] || {};
+      return `<tr><td class="mono">${x.device_id}</td>
+      <td>${x.online ? '<span class="pill ok">online</span>' : '<span class="pill bad">offline</span>'}</td>
+      <td class="mono">${x.owner_address || ""}</td><td class="mono">${x.guard_endpoint}</td><td>${x.rehome_count || 0}</td>
+      <td><button onclick="sendCmd('${x.device_id}')">Send command</button></td>
+      <td>${r.html || ""}${r.changed ? ' <span class="changed">path changed</span>' : ""}</td><td>${r.ms ?? ""}</td></tr>`; }).join("");
+  return devices;
+}
+
+async function sendCmd(dev, quiet) {
+  const delay = Number($("delay").value || 0);
+  if (!quiet) log(`${dev}: command sent (delay ${delay}s)`);
+  const t0 = performance.now();
+  const r = await api("POST", `devices/${dev}/command`, { cmd: "status", delay });
+  const ms = Math.round(performance.now() - t0);
+  const key = pathKey(r.data.trace);
+  const changed = lastPath[dev] && lastPath[dev] !== key;
+  lastPath[dev] = key;
+  lastResult[dev] = { html: r.status === 200 ? pathHtml(r.data.trace) : `<span class="pill bad">${r.status} ${r.data.error || ""}</span>`, ms, changed };
+  log(`${dev}: HTTP ${r.status} in ${ms} ms ${r.status === 200 ? "" : "- " + (r.data.error || "")}${changed ? "  PATH CHANGED" : ""}`);
+  await refresh();
+}
+
+async function sweep() {
+  $("sweepBtn").disabled = true;
+  try {
+    const devices = (await api("GET", "devices")).data.devices || [];
+    log(`Commanding ${devices.length} devices...`);
+    await Promise.all(devices.map((x) => sendCmd(x.device_id, true)));
+    const ok = devices.filter((x) => (lastResult[x.device_id] || {}).html?.includes("hop")).length;
+    log(`Done: ${ok}/${devices.length} succeeded`);
+  } finally { $("sweepBtn").disabled = false; }
+}
+
+async function crashServer(id) {
+  if (!confirm(`Crash server ${short(id)}? ECS will start a replacement task with a new IP.`)) return;
+  const r = await api("POST", `admin/servers/${id}/crash`);
+  log(`crash server ${short(id)}: ${r.status} ${JSON.stringify(r.data)}`);
+  refresh();
+}
+
+async function crashGuard(id) {
+  if (!confirm(`Crash guard ${short(id)}? Its agents will reconnect to another Guard.`)) return;
+  const r = await api("POST", `admin/guards/${id}/crash`);
+  log(`crash guard ${short(id)}: ${r.status} ${JSON.stringify(r.data)}`);
+  refresh();
+}
+
+$("sweepBtn").onclick = sweep;
+refresh();
+setInterval(() => { if ($("auto").checked) refresh().catch((e) => log("refresh failed: " + e)); }, 3000);
+</script>
+</body>
+</html>
+"""
 
 
 # ---------------------------------------------------------------------------

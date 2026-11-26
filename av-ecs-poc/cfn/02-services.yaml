@@ -12,6 +12,11 @@ Parameters:
   ImageTag:
     Type: String
     Default: v1
+  EnableCrashButtons:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Lets the Director test page make a server or guard task exit (ECS replaces it). POC only.
   CpuArchitecture:
     Type: String
     Default: X86_64
@@ -85,6 +90,7 @@ Resources:
             - { Name: director-http, ContainerPort: 11000, Protocol: tcp }
           Environment:
             - { Name: ROLE, Value: director }
+            - { Name: ADMIN_ACTIONS, Value: !Ref EnableCrashButtons }
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
             - { Name: DIRECTOR_PORT, Value: "11000" }
             - { Name: CMD_TIMEOUT_SECONDS, Value: "330" }
@@ -132,6 +138,7 @@ Resources:
             - { Name: server-http, ContainerPort: 8261, Protocol: tcp, AppProtocol: http }
           Environment:
             - { Name: ROLE, Value: server }
+            - { Name: ADMIN_ACTIONS, Value: !Ref EnableCrashButtons }
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
             - { Name: SERVER_PORT, Value: "8261" }
             - { Name: CMD_TIMEOUT_SECONDS, Value: "330" }
@@ -184,6 +191,7 @@ Resources:
             - - { Name: guard-tunnel, ContainerPort: 9000, Protocol: tcp }
           Environment:
             - { Name: ROLE, Value: guard }
+            - { Name: ADMIN_ACTIONS, Value: !Ref EnableCrashButtons }
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
             - { Name: TUNNEL_PORT, Value: "9000" }
             - { Name: DEVICE_PORT_MIN, Value: "10000" }
@@ -488,7 +496,7 @@ Resources:
 
 Outputs:
   DirectorUrl:
-    Description: Workstation entry point (internal NLB, any Director instance)
+    Description: Workstation entry point and browser test page (internal NLB, any Director instance)
     Value: !Sub "http://${DirectorNlb.DNSName}:11000"
   GuardEndpoint:
     Description: Branch agent tunnel endpoint (internal NLB, any Guard instance)

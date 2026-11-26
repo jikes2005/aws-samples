@@ -10,5 +10,7 @@ REPO_URI=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$
   --query "Stacks[0].Outputs[?OutputKey=='RepositoryUri'].OutputValue" --output text)
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
 docker build --platform linux/amd64 --build-arg BASE_IMAGE="$BASE_IMAGE" --build-arg PIP_INDEX_URL="$PIP_INDEX_URL" \
-  -t "${REPO_URI}:${TAG}" "$HERE/../app"
+  -t "${PROJECT}-vendor:${TAG}" "$HERE/../app"
+docker build --platform linux/amd64 --build-arg VENDOR_IMAGE="${PROJECT}-vendor:${TAG}" \
+  -t "${REPO_URI}:${TAG}" "$HERE/../wrapper"
 docker push "${REPO_URI}:${TAG}"

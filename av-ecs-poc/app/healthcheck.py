@@ -1,3 +1,4 @@
+"""Container health check per role (ECS passes the result to Service Connect / Cloud Map)."""
 import os
 import socket
 import sys
